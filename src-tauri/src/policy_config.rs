@@ -9,7 +9,6 @@ pub mod win_policy {
     use windows::Win32::Media::Audio::{
         eCommunications, eConsole, eMultimedia, ERole, WAVEFORMATEX,
     };
-    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
     };
@@ -88,14 +87,14 @@ pub mod win_policy {
             device_name: PCWSTR,
             fx_store: i32,
             key: *const PROPERTYKEY,
-            value: *mut PROPVARIANT,
+            value: *mut core::ffi::c_void,
         ) -> HRESULT,
         pub set_property_value: unsafe extern "system" fn(
             this: *mut IPolicyConfigRaw,
             device_name: PCWSTR,
             fx_store: i32,
             key: *const PROPERTYKEY,
-            value: *const PROPVARIANT,
+            value: *const core::ffi::c_void,
         ) -> HRESULT,
         pub set_default_endpoint: unsafe extern "system" fn(
             this: *mut IPolicyConfigRaw,

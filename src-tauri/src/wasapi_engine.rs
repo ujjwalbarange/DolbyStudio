@@ -388,15 +388,13 @@ mod win_wasapi {
 
             let mut clock_drift_adjust_ms = 0.0;
             if let Some(ref clock) = self.audio_clock {
-                let mut freq = 0u64;
                 let mut dev_pos = 0u64;
                 let mut qpc_pos = 0u64;
-                if clock.GetFrequency(&mut freq).is_ok()
-                    && freq > 0
-                    && clock.GetPosition(&mut dev_pos, Some(&mut qpc_pos)).is_ok()
-                {
-                    let _play_sec = (dev_pos as f64) / (freq as f64);
-                    clock_drift_adjust_ms = 0.0;
+                if let Ok(freq) = clock.GetFrequency() {
+                    if freq > 0 && clock.GetPosition(&mut dev_pos, Some(&mut qpc_pos)).is_ok() {
+                        let _play_sec = (dev_pos as f64) / (freq as f64);
+                        clock_drift_adjust_ms = 0.0;
+                    }
                 }
             }
 

@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod dsp;
+mod policy_config;
 mod wasapi_engine;
 
 use std::sync::{Arc, Mutex};
@@ -40,7 +41,10 @@ fn update_dsp_config(
     state: State<'_, Arc<Mutex<SharedAudioEngineState>>>,
 ) -> Result<(), String> {
     if let Ok(mut guard) = state.lock() {
-        guard.dsp.master_enabled = master_enabled;
+        if guard.dsp.master_enabled != master_enabled {
+            guard.dsp.master_enabled = master_enabled;
+            guard.master_switch_dirty = true;
+        }
         guard.dsp.surround_enabled = surround_virtualiser || mode == "SPATIAL_AUDIO";
         guard.dsp.volume_leveller_enabled = volume_leveller;
         guard.dsp.update_eq_bands(&bands_db);

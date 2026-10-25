@@ -1,0 +1,68 @@
+;=============================================================================
+; Dolby Atmos Audio - Windows WDK Virtual Audio Render Endpoint Driver (.inf)
+; Exposes "Dolby Atmos Audio" (48,000 Hz, 32-Bit IEEE Float Stereo PCM)
+; in the Windows Taskbar Sound Output / Playback Device Selector.
+;=============================================================================
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = MEDIA
+ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+DriverVer   = 10/24/2026,1.0.0.1
+CatalogFile = dolby_atmos_virtual_audio.cat
+PnpLockdown = 1
+
+[Manufacturer]
+%MfgName% = DolbyAtmosAudioSection,NTamd64
+
+[DolbyAtmosAudioSection.NTamd64]
+%DolbyDeviceDesc% = DolbyVirtualEndpointInstall, ROOT\DolbyAtmosVirtualAudio
+
+[DolbyVirtualEndpointInstall.NT]
+Include = ks.inf, wdmaudio.inf
+Needs   = KS.Registration, WDMAUDIO.Registration.NT
+AddReg  = DolbyVirtualEndpoint.AddReg
+
+[DolbyVirtualEndpointInstall.NT.Interfaces]
+AddInterface = %KSCATEGORY_AUDIO%, %KSSTRING_SpeakerWave%, DolbySpeakerTopology
+AddInterface = %KSCATEGORY_RENDER%, %KSSTRING_SpeakerWave%, DolbySpeakerTopology
+AddInterface = %KSCATEGORY_REALTIME%, %KSSTRING_SpeakerWave%, DolbySpeakerTopology
+
+[DolbySpeakerTopology]
+AddReg = DolbySpeakerTopology.AddReg
+
+[DolbySpeakerTopology.AddReg]
+HKR,,FriendlyName,,%DolbyEndpointFriendlyName%
+HKR,,CLSID,,%Proxy.CLSID%
+
+[DolbyVirtualEndpoint.AddReg]
+HKR,,AssociatedFilters,,"wdmaud,swmidi,redbook"
+HKR,,Driver,,sysvad.sys
+HKR,Drivers,SubClasses,,"wave,midi,mixer,aux"
+HKR,Drivers\wave\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\midi\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\mixer\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\aux\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\wave\wdmaud.drv,Description,,%DolbyEndpointFriendlyName%
+HKR,Drivers\mixer\wdmaud.drv,Description,,%DolbyEndpointFriendlyName%
+; Default 48,000 Hz 32-bit IEEE Float Stereo Mix Format
+HKR,EP\0,%PKEY_AudioEngine_DeviceFormat%,0x00000001,fe,ff,02,00,80,bb,00,00,00,dc,05,00,08,00,20,00,16,00,20,00,03,00,00,00,03,00,00,00,00,00,10,00,80,00,00,aa,00,38,9b,71
+HKR,EP\0,%PKEY_Device_FriendlyName%,,%DolbyEndpointFriendlyName%
+
+[DolbyVirtualEndpointInstall.NT.Services]
+Include = wdmaudio.inf
+Needs   = WDMAUDIO.Registration.NT.Services
+
+[Strings]
+ProviderName              = "Dolby Studio Audio Engineering"
+MfgName                   = "Dolby Atmos Audio"
+DolbyDeviceDesc           = "Dolby Atmos Audio Virtual Render Device"
+DolbyEndpointFriendlyName = "Dolby Atmos Audio"
+Proxy.CLSID               = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+KSCATEGORY_AUDIO          = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_RENDER         = "{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_REALTIME       = "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
+KSSTRING_SpeakerWave      = "DolbyAtmosSpeakerWave"
+PKEY_AudioEngine_DeviceFormat = "{f19f064d-082c-4e27-bc73-6882a1bb8e4c},0"
+PKEY_Device_FriendlyName      = "{a45c254e-df1c-4efd-8020-67d146a850e0},14"

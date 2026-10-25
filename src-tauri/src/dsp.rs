@@ -256,8 +256,11 @@ pub struct PsychoacousticDspPipeline {
     pub volume_leveller_enabled: bool,
     pub is_headphone_route: bool,
 
-    // Stage 2: 10-band cascaded biquad EQ + Pultec low-end shaper
+    // Stage 2: 10-band cascaded biquad EQ + Dynamic IEQ harshness suppressor + Pultec low-end shaper
     eq_bands: [BiquadFilter; 10],
+    ieq_detector_bp: BiquadFilter,
+    ieq_dynamic_notch: BiquadFilter,
+    ieq_harshness_env: f64,
     pultec_boost: BiquadFilter,
     pultec_cut: BiquadFilter,
     sub_harmonic_bp: BiquadFilter,
@@ -290,6 +293,12 @@ impl PsychoacousticDspPipeline {
             eq_bands[i].set_peaking_eq(fc, 1.414, 0.0, SAMPLE_RATE);
         }
 
+        let mut ieq_detector_bp = BiquadFilter::default();
+        ieq_detector_bp.set_band_pass(3600.0, 1.7, SAMPLE_RATE);
+
+        let mut ieq_dynamic_notch = BiquadFilter::default();
+        ieq_dynamic_notch.set_peaking_eq(3600.0, 2.2, 0.0, SAMPLE_RATE);
+
         let mut pultec_boost = BiquadFilter::default();
         pultec_boost.set_low_shelf(60.0, 0.707, 2.2, SAMPLE_RATE);
 
@@ -319,6 +328,9 @@ impl PsychoacousticDspPipeline {
             volume_leveller_enabled: true,
             is_headphone_route: false,
             eq_bands,
+            ieq_detector_bp,
+            ieq_dynamic_notch,
+            ieq_harshness_env: 0.0,
             pultec_boost,
             pultec_cut,
             sub_harmonic_bp,
@@ -366,16 +378,32 @@ impl PsychoacousticDspPipeline {
         let xtc_delay_samples = 11usize; // ~0.22 ms speaker crosstalk delay
         let lookahead_len = self.lookahead_l.len();
 
+        // Update Dynamic IEQ harshness notch once per block based on tracked 3.6 kHz energy
+        let harsh_cut_db = if self.ieq_harshness_env > 0.08 {
+            -((self.ieq_harshness_env - 0.08) * 14.0).clamp(0.0, 3.5)
+        } else {
+            0.0
+        };
+        self.ieq_dynamic_notch
+            .set_peaking_eq(3600.0, 2.2, harsh_cut_db, SAMPLE_RATE);
+
         for f in 0..frames {
             let mut l = (buffer[f * 2] as f64) * HEADROOM_GAIN;
             let mut r = (buffer[f * 2 + 1] as f64) * HEADROOM_GAIN;
 
-            // Stage 2: Dynamic 10-Band Cascaded Biquad Equalizer + Pultec Low-End Shaper
+            // Stage 2: Dynamic 10-Band Cascaded Biquad Equalizer + Dynamic IEQ + Pultec Shaper
             for band in self.eq_bands.iter_mut() {
                 let (nl, nr) = band.process_stereo(l, r);
                 l = nl;
                 r = nr;
             }
+            let (hl, hr) = self.ieq_detector_bp.process_stereo(l, r);
+            let harsh_peak = hl.abs().max(hr.abs());
+            self.ieq_harshness_env = 0.998 * self.ieq_harshness_env + 0.002 * harsh_peak;
+            let (dl, dr) = self.ieq_dynamic_notch.process_stereo(l, r);
+            l = dl;
+            r = dr;
+
             let (pl, pr) = self.pultec_boost.process_stereo(l, r);
             let (cl, cr) = self.pultec_cut.process_stereo(pl, pr);
             let (sub_l, sub_r) = self.sub_harmonic_bp.process_stereo(cl, cr);

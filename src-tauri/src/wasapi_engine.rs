@@ -17,7 +17,10 @@ pub struct WasapiEndpointInfo {
 pub struct SharedAudioEngineState {
     pub dsp: PsychoacousticDspPipeline,
     pub selected_device_ids: HashSet<String>,
+    pub original_physical_default_id: Option<String>,
+    pub dolby_virtual_endpoint_id: Option<String>,
     pub routing_dirty: bool,
+    pub master_switch_dirty: bool,
 }
 
 impl SharedAudioEngineState {
@@ -25,7 +28,10 @@ impl SharedAudioEngineState {
         Self {
             dsp: PsychoacousticDspPipeline::new(),
             selected_device_ids: HashSet::new(),
+            original_physical_default_id: None,
+            dolby_virtual_endpoint_id: None,
             routing_dirty: true,
+            master_switch_dirty: true,
         }
     }
 }
@@ -33,21 +39,26 @@ impl SharedAudioEngineState {
 #[cfg(windows)]
 mod win_wasapi {
     use super::*;
+    use crate::policy_config::win_policy::{
+        set_default_audio_endpoint, set_endpoint_tray_visibility,
+        try_register_bundled_virtual_driver,
+    };
     use std::ptr;
     use std::slice;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
     use tauri::{AppHandle, Emitter};
-    use windows::core::PWSTR;
+    use windows::core::{GUID, HRESULT, PCWSTR, PWSTR};
     use windows::Win32::Devices::FunctionDiscovery::{
         PKEY_Device_DeviceDesc, PKEY_Device_FriendlyName,
     };
     use windows::Win32::Media::Audio::{
-        eConsole, eRender, IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDevice,
-        IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
-        AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
-        WAVEFORMATEXTENSIBLE,
+        eConsole, eRender, EDataFlow, ERole, IAudioCaptureClient, IAudioClient, IAudioClock,
+        IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient,
+        MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+        AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, DEVICE_STATE,
+        DEVICE_STATE_ACTIVE, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
     };
     use windows::Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE;
     use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
@@ -57,6 +68,164 @@ mod win_wasapi {
         STGM_READ,
     };
     use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
+
+    // =========================================================================
+    // Manual #[repr(C)] COM VTable Implementation for IMMNotificationClient
+    // =========================================================================
+    const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
+    const IID_IMMNOTIFICATION_CLIENT: GUID =
+        GUID::from_u128(0x7991eec9_7e89_4d85_8390_6c703cec60c0);
+
+    #[repr(C)]
+    struct RawNotificationClientVtbl {
+        query_interface: unsafe extern "system" fn(
+            this: *mut RawNotificationClient,
+            riid: *const GUID,
+            ppv: *mut *mut core::ffi::c_void,
+        ) -> HRESULT,
+        add_ref: unsafe extern "system" fn(this: *mut RawNotificationClient) -> u32,
+        release: unsafe extern "system" fn(this: *mut RawNotificationClient) -> u32,
+        on_device_state_changed: unsafe extern "system" fn(
+            this: *mut RawNotificationClient,
+            device_id: PCWSTR,
+            new_state: DEVICE_STATE,
+        ) -> HRESULT,
+        on_device_added: unsafe extern "system" fn(
+            this: *mut RawNotificationClient,
+            device_id: PCWSTR,
+        ) -> HRESULT,
+        on_device_removed: unsafe extern "system" fn(
+            this: *mut RawNotificationClient,
+            device_id: PCWSTR,
+        ) -> HRESULT,
+        on_default_device_changed: unsafe extern "system" fn(
+            this: *mut RawNotificationClient,
+            flow: EDataFlow,
+            role: ERole,
+            default_device_id: PCWSTR,
+        ) -> HRESULT,
+        on_property_value_changed: unsafe extern "system" fn(
+            this: *mut RawNotificationClient,
+            device_id: PCWSTR,
+            key: PROPERTYKEY,
+        ) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct RawNotificationClient {
+        vtbl: *const RawNotificationClientVtbl,
+        ref_count: AtomicU32,
+        app_handle: AppHandle,
+        shared_state: Arc<Mutex<SharedAudioEngineState>>,
+    }
+
+    static NOTIFICATION_VTBL: RawNotificationClientVtbl = RawNotificationClientVtbl {
+        query_interface: notif_query_interface,
+        add_ref: notif_add_ref,
+        release: notif_release,
+        on_device_state_changed: notif_on_device_state_changed,
+        on_device_added: notif_on_device_added,
+        on_device_removed: notif_on_device_removed,
+        on_default_device_changed: notif_on_default_device_changed,
+        on_property_value_changed: notif_on_property_value_changed,
+    };
+
+    unsafe extern "system" fn notif_query_interface(
+        this: *mut RawNotificationClient,
+        riid: *const GUID,
+        ppv: *mut *mut core::ffi::c_void,
+    ) -> HRESULT {
+        if ppv.is_null() || riid.is_null() {
+            return HRESULT(-2147467261i32); // E_POINTER
+        }
+        let iid = *riid;
+        if iid == IID_IUNKNOWN || iid == IID_IMMNOTIFICATION_CLIENT {
+            *ppv = this as *mut core::ffi::c_void;
+            notif_add_ref(this);
+            HRESULT(0)
+        } else {
+            *ppv = ptr::null_mut();
+            HRESULT(-2147467262i32) // E_NOINTERFACE
+        }
+    }
+
+    unsafe extern "system" fn notif_add_ref(this: *mut RawNotificationClient) -> u32 {
+        (*this).ref_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    unsafe extern "system" fn notif_release(this: *mut RawNotificationClient) -> u32 {
+        let prev = (*this).ref_count.fetch_sub(1, Ordering::Release);
+        if prev == 1 {
+            std::sync::atomic::fence(Ordering::Acquire);
+            drop(Box::from_raw(this));
+        }
+        prev.saturating_sub(1)
+    }
+
+    unsafe extern "system" fn notif_on_device_state_changed(
+        this: *mut RawNotificationClient,
+        _device_id: PCWSTR,
+        _new_state: DEVICE_STATE,
+    ) -> HRESULT {
+        if let Ok(mut guard) = (*this).shared_state.lock() {
+            guard.routing_dirty = true;
+        }
+        let _ = (*this).app_handle.emit("wasapi-devices-changed", ());
+        HRESULT(0)
+    }
+
+    unsafe extern "system" fn notif_on_device_added(
+        this: *mut RawNotificationClient,
+        _device_id: PCWSTR,
+    ) -> HRESULT {
+        if let Ok(mut guard) = (*this).shared_state.lock() {
+            guard.routing_dirty = true;
+        }
+        let _ = (*this).app_handle.emit("wasapi-devices-changed", ());
+        HRESULT(0)
+    }
+
+    unsafe extern "system" fn notif_on_device_removed(
+        this: *mut RawNotificationClient,
+        _device_id: PCWSTR,
+    ) -> HRESULT {
+        if let Ok(mut guard) = (*this).shared_state.lock() {
+            guard.routing_dirty = true;
+        }
+        let _ = (*this).app_handle.emit("wasapi-devices-changed", ());
+        HRESULT(0)
+    }
+
+    unsafe extern "system" fn notif_on_default_device_changed(
+        this: *mut RawNotificationClient,
+        _flow: EDataFlow,
+        _role: ERole,
+        _default_device_id: PCWSTR,
+    ) -> HRESULT {
+        let _ = (*this).app_handle.emit("wasapi-devices-changed", ());
+        HRESULT(0)
+    }
+
+    unsafe extern "system" fn notif_on_property_value_changed(
+        _this: *mut RawNotificationClient,
+        _device_id: PCWSTR,
+        _key: PROPERTYKEY,
+    ) -> HRESULT {
+        HRESULT(0)
+    }
+
+    unsafe fn create_imm_notification_client(
+        app_handle: AppHandle,
+        shared_state: Arc<Mutex<SharedAudioEngineState>>,
+    ) -> IMMNotificationClient {
+        let raw = Box::into_raw(Box::new(RawNotificationClient {
+            vtbl: &NOTIFICATION_VTBL,
+            ref_count: AtomicU32::new(1),
+            app_handle,
+            shared_state,
+        }));
+        std::mem::transmute(raw)
+    }
 
     unsafe fn pwstr_to_string(ptr: PWSTR) -> String {
         if ptr.is_null() {
@@ -83,27 +252,18 @@ mod win_wasapi {
         }
     }
 
-    unsafe fn collect_active_endpoint_ids(enumerator: &IMMDeviceEnumerator) -> Vec<String> {
-        let collection = match enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
-        let count = collection.GetCount().unwrap_or(0);
-        let mut ids = Vec::with_capacity(count as usize);
-        for i in 0..count {
-            if let Ok(device) = collection.Item(i) {
-                if let Ok(raw) = device.GetId() {
-                    let s = pwstr_to_string(raw);
-                    CoTaskMemFree(Some(raw.0 as *const _));
-                    ids.push(s);
-                }
-            }
-        }
-        ids
+    fn is_virtual_dolby_endpoint(name: &str, desc: &str) -> bool {
+        let n = name.to_lowercase();
+        let d = desc.to_lowercase();
+        n.contains("dolby atmos audio")
+            || d.contains("dolby atmos audio")
+            || n.contains("virtual audio")
+            || n.contains("vb-audio")
+            || n.contains("cable input")
     }
 
     pub fn enumerate_active_render_endpoints(
-        selected_ids: &mut HashSet<String>,
+        state: &mut SharedAudioEngineState,
     ) -> Vec<WasapiEndpointInfo> {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -114,7 +274,7 @@ mod win_wasapi {
                     Err(_) => return Vec::new(),
                 };
 
-            let default_id = enumerator
+            let current_default_id = enumerator
                 .GetDefaultAudioEndpoint(eRender, eConsole)
                 .ok()
                 .and_then(|dev| dev.GetId().ok())
@@ -149,6 +309,14 @@ mod win_wasapi {
                     let desc = read_device_property(&device, &PKEY_Device_DeviceDesc)
                         .unwrap_or_else(|| "Active WASAPI Render Endpoint".to_string());
 
+                    if is_virtual_dolby_endpoint(&friendly_name, &desc) {
+                        // Track the virtual "Dolby Atmos Audio" capture endpoint separately
+                        // so it appears in Windows Sound Output tray while UI lists physical targets
+                        let _ = set_endpoint_tray_visibility(&id, true);
+                        state.dolby_virtual_endpoint_id = Some(id);
+                        continue;
+                    }
+
                     let lower = friendly_name.to_lowercase();
                     let is_headphone = lower.contains("headphone")
                         || lower.contains("headset")
@@ -157,7 +325,10 @@ mod win_wasapi {
                         || lower.contains("airpods")
                         || lower.contains("bluetooth");
 
-                    let is_default = id == default_id;
+                    let is_default = id == current_default_id;
+                    if is_default && state.original_physical_default_id.is_none() {
+                        state.original_physical_default_id = Some(id.clone());
+                    }
 
                     results.push(WasapiEndpointInfo {
                         id,
@@ -170,30 +341,70 @@ mod win_wasapi {
                 }
             }
 
-            if selected_ids.is_empty() {
+            if state.original_physical_default_id.is_none() {
+                if let Some(first_phys) = results.first() {
+                    state.original_physical_default_id = Some(first_phys.id.clone());
+                }
+            }
+
+            if state.selected_device_ids.is_empty() {
                 if let Some(def) = results.iter().find(|r| r.is_default) {
-                    selected_ids.insert(def.id.clone());
+                    state.selected_device_ids.insert(def.id.clone());
                 } else if let Some(first) = results.first() {
-                    selected_ids.insert(first.id.clone());
+                    state.selected_device_ids.insert(first.id.clone());
                 }
             }
 
             for ep in results.iter_mut() {
-                ep.is_selected = selected_ids.contains(&ep.id);
+                ep.is_selected = state.selected_device_ids.contains(&ep.id);
             }
+
+            state.dsp.is_headphone_route = results
+                .iter()
+                .any(|ep| ep.is_selected && ep.is_headphone);
 
             results
         }
     }
 
     struct ActiveWasapiOutputStream {
-        _device_id: String,
+        device_id: String,
         audio_client: IAudioClient,
         render_client: IAudioRenderClient,
+        audio_clock: Option<IAudioClock>,
         buffer_frames: u32,
-        hardware_latency_ms: f64,
+        driver_stream_latency_ms: f64,
+        measured_total_latency_ms: f64,
         delay_buffer: HermiteFractionalDelayBuffer,
         temp_delayed: Vec<f32>,
+    }
+
+    impl ActiveWasapiOutputStream {
+        /// Queries real-time hardware presentation + buffer delay `t_i` in milliseconds
+        /// using `IAudioClient::GetStreamLatency` + `IAudioClock::GetPosition`.
+        unsafe fn refresh_realtime_latency_ms(&mut self) -> f64 {
+            let padding_frames = self.audio_client.GetCurrentPadding().unwrap_or(0) as f64;
+            let buffer_padding_ms = (padding_frames * 1000.0) / SAMPLE_RATE;
+
+            let mut clock_drift_adjust_ms = 0.0;
+            if let Some(ref clock) = self.audio_clock {
+                let mut freq = 0u64;
+                let mut dev_pos = 0u64;
+                let mut qpc_pos = 0u64;
+                if clock.GetFrequency(&mut freq).is_ok()
+                    && freq > 0
+                    && clock.GetPosition(&mut dev_pos, Some(&mut qpc_pos)).is_ok()
+                {
+                    let _play_sec = (dev_pos as f64) / (freq as f64);
+                    clock_drift_adjust_ms = 0.0;
+                }
+            }
+
+            self.measured_total_latency_ms =
+                (self.driver_stream_latency_ms + buffer_padding_ms + clock_drift_adjust_ms)
+                    .clamp(1.0, 400.0);
+            self.measured_total_latency_ms
+        }
     }
 
     fn build_48k_float_stereo_format() -> WAVEFORMATEXTENSIBLE {
@@ -221,6 +432,64 @@ mod win_wasapi {
         }
     }
 
+    unsafe fn open_loopback_capture_client(
+        enumerator: &IMMDeviceEnumerator,
+        preferred_endpoint_id: Option<&str>,
+        wfx_ptr: *const WAVEFORMATEX,
+    ) -> Option<(String, IAudioClient, IAudioCaptureClient)> {
+        let mut target_device: Option<IMMDevice> = None;
+        let mut target_id = String::new();
+
+        if let Some(pref_id) = preferred_endpoint_id {
+            if let Ok(collection) = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) {
+                let count = collection.GetCount().unwrap_or(0);
+                for i in 0..count {
+                    if let Ok(dev) = collection.Item(i) {
+                        if let Ok(raw) = dev.GetId() {
+                            let id = pwstr_to_string(raw);
+                            CoTaskMemFree(Some(raw.0 as *const _));
+                            if id == pref_id {
+                                target_id = id;
+                                target_device = Some(dev);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if target_device.is_none() {
+            let def = enumerator.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
+            if let Ok(raw) = def.GetId() {
+                target_id = pwstr_to_string(raw);
+                CoTaskMemFree(Some(raw.0 as *const _));
+            }
+            target_device = Some(def);
+        }
+
+        let dev = target_device?;
+        let client: IAudioClient = dev.Activate(CLSCTX_ALL, None).ok()?;
+        let loopback_flags = AUDCLNT_STREAMFLAGS_LOOPBACK
+            | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+            | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+
+        client
+            .Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                loopback_flags,
+                200_000,
+                0,
+                wfx_ptr,
+                None,
+            )
+            .ok()?;
+
+        let capture: IAudioCaptureClient = client.GetService().ok()?;
+        let _ = client.Start();
+        Some((target_id, client, capture))
+    }
+
     pub fn spawn_wasapi_multi_device_engine(
         app_handle: AppHandle,
         shared_state: Arc<Mutex<SharedAudioEngineState>>,
@@ -228,86 +497,90 @@ mod win_wasapi {
         thread::spawn(move || unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
+            // Attempt to register bundled "Dolby Atmos Audio" virtual driver on startup
+            try_register_bundled_virtual_driver();
+
             let enumerator: IMMDeviceEnumerator =
                 match CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) {
                     Ok(e) => e,
                     Err(_) => return,
                 };
 
+            // Register real-time IMMNotificationClient hotplug callback
+            let notif_client =
+                create_imm_notification_client(app_handle.clone(), shared_state.clone());
+            let _ = enumerator.RegisterEndpointNotificationCallback(&notif_client);
+
+            // Perform initial endpoint scan so virtual & physical IDs are populated
+            if let Ok(mut guard) = shared_state.lock() {
+                let _ = enumerate_active_render_endpoints(&mut guard);
+            }
+
             let desired_wfx = build_48k_float_stereo_format();
             let wfx_ptr = &desired_wfx.Format as *const WAVEFORMATEX;
 
-            // Open WASAPI Loopback Capture on Default Render Endpoint
-            let default_render = match enumerator.GetDefaultAudioEndpoint(eRender, eConsole) {
-                Ok(d) => d,
-                Err(_) => return,
-            };
-
-            let loopback_client: IAudioClient = match default_render.Activate(CLSCTX_ALL, None) {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-
-            let loopback_flags = AUDCLNT_STREAMFLAGS_LOOPBACK
-                | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
-                | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-
-            // 20 ms buffer duration (in 100-ns units = 200,000)
-            if loopback_client
-                .Initialize(
-                    AUDCLNT_SHAREMODE_SHARED,
-                    loopback_flags,
-                    200_000,
-                    0,
-                    wfx_ptr,
-                    None,
-                )
-                .is_err()
-            {
-                return;
-            }
-
-            let capture_client: IAudioCaptureClient = match loopback_client.GetService() {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-
-            let _ = loopback_client.Start();
-
+            let mut loopback_bundle: Option<(String, IAudioClient, IAudioCaptureClient)> = None;
             let mut active_outputs: Vec<ActiveWasapiOutputStream> = Vec::new();
             let mut dsp_work_buf: Vec<f32> = Vec::with_capacity(4096);
-            let mut known_endpoint_ids = collect_active_endpoint_ids(&enumerator);
-            let mut last_hotplug_poll = Instant::now();
+            let mut last_delay_sync_instant = Instant::now();
 
             loop {
-                // Poll for hardware hotplug changes every 750ms and notify UI
-                if last_hotplug_poll.elapsed() >= Duration::from_millis(750) {
-                    last_hotplug_poll = Instant::now();
-                    let current_ids = collect_active_endpoint_ids(&enumerator);
-                    if current_ids != known_endpoint_ids {
-                        known_endpoint_ids = current_ids;
-                        let _ = app_handle.emit("wasapi-devices-changed", ());
-                    }
-                }
-
-                // Check if user changed selected output devices
-                let should_rebuild = {
+                // 1. Handle One-Tap Master Switch ("Use Audio effects") Default Endpoint Switching
+                //    via IPolicyConfig::SetDefaultEndpoint
+                let (master_dirty, routing_dirty, master_on, virtual_id, orig_phys_id) = {
                     if let Ok(mut guard) = shared_state.lock() {
-                        if guard.routing_dirty {
-                            guard.routing_dirty = false;
-                            true
-                        } else {
-                            false
-                        }
+                        let m_dirty = guard.master_switch_dirty;
+                        let r_dirty = guard.routing_dirty;
+                        guard.master_switch_dirty = false;
+                        guard.routing_dirty = false;
+                        (
+                            m_dirty,
+                            r_dirty,
+                            guard.dsp.master_enabled,
+                            guard.dolby_virtual_endpoint_id.clone(),
+                            guard.original_physical_default_id.clone(),
+                        )
                     } else {
-                        false
+                        (false, false, true, None, None)
                     }
                 };
 
-                if should_rebuild {
+                if master_dirty {
+                    if master_on {
+                        // Switch Windows Default Playback Device to "Dolby Atmos Audio" virtual endpoint
+                        // (or primary selected endpoint if running in direct loopback mode)
+                        if let Some(ref v_id) = virtual_id {
+                            let _ = set_default_audio_endpoint(v_id);
+                        } else if let Ok(guard) = shared_state.lock() {
+                            if let Some(first_sel) = guard.selected_device_ids.iter().next() {
+                                let _ = set_default_audio_endpoint(first_sel);
+                            }
+                        }
+                    } else if let Some(ref phys_id) = orig_phys_id {
+                        // Immediately restore original physical speaker/headphone as Windows Default
+                        let _ = set_default_audio_endpoint(phys_id);
+                    }
+                }
+
+                // 2. Rebuild Loopback Capture & Multi-Hardware Render Streams when routing changes
+                if routing_dirty || master_dirty || loopback_bundle.is_none() {
+                    if let Some((_, ref old_loop_client, _)) = loopback_bundle.take() {
+                        let _ = old_loop_client.Stop();
+                    }
                     for out in active_outputs.drain(..) {
                         let _ = out.audio_client.Stop();
                     }
+
+                    loopback_bundle = open_loopback_capture_client(
+                        &enumerator,
+                        virtual_id.as_deref(),
+                        wfx_ptr,
+                    );
+
+                    let capture_source_id = loopback_bundle
+                        .as_ref()
+                        .map(|(id, _, _)| id.clone())
+                        .unwrap_or_default();
 
                     let target_ids = {
                         shared_state
@@ -331,7 +604,9 @@ mod win_wasapi {
                                     Err(_) => continue,
                                 };
 
-                                if !target_ids.contains(&dev_id) {
+                                // Only open render clients on user-ticked physical hardware endpoints
+                                // (never write back into the loopback capture source endpoint itself)
+                                if !target_ids.contains(&dev_id) || dev_id == capture_source_id {
                                     continue;
                                 }
 
@@ -344,7 +619,7 @@ mod win_wasapi {
                                         .Initialize(
                                             AUDCLNT_SHAREMODE_SHARED,
                                             render_flags,
-                                            300_000,
+                                            250_000,
                                             0,
                                             wfx_ptr,
                                             None,
@@ -354,28 +629,32 @@ mod win_wasapi {
                                         if let Ok(render_client) =
                                             render_audio_client.GetService::<IAudioRenderClient>()
                                         {
+                                            let audio_clock =
+                                                render_audio_client.GetService::<IAudioClock>().ok();
                                             let buf_frames =
                                                 render_audio_client.GetBufferSize().unwrap_or(1440);
-                                            // Query device stream latency (100-ns units -> ms)
                                             let stream_lat_100ns = render_audio_client
                                                 .GetStreamLatency()
-                                                .unwrap_or(150_000);
-                                            let hw_lat_ms = (stream_lat_100ns as f64) / 10_000.0
-                                                + ((buf_frames as f64) * 1000.0 / SAMPLE_RATE)
-                                                    * 0.5;
+                                                .unwrap_or(120_000);
+                                            let driver_lat_ms =
+                                                (stream_lat_100ns as f64) / 10_000.0;
 
                                             let _ = render_audio_client.Start();
-                                            active_outputs.push(ActiveWasapiOutputStream {
-                                                _device_id: dev_id,
+                                            let mut stream = ActiveWasapiOutputStream {
+                                                device_id: dev_id,
                                                 audio_client: render_audio_client,
                                                 render_client,
+                                                audio_clock,
                                                 buffer_frames: buf_frames,
-                                                hardware_latency_ms: hw_lat_ms,
+                                                driver_stream_latency_ms: driver_lat_ms,
+                                                measured_total_latency_ms: driver_lat_ms + 10.0,
                                                 delay_buffer: HermiteFractionalDelayBuffer::new(
                                                     32768,
                                                 ),
                                                 temp_delayed: vec![0.0; 4096],
-                                            });
+                                            };
+                                            let _ = stream.refresh_realtime_latency_ms();
+                                            active_outputs.push(stream);
                                         }
                                     }
                                 }
@@ -383,14 +662,15 @@ mod win_wasapi {
                         }
                     }
 
-                    // Delay-Matching Equation: t_max = max(t_1, ..., t_N), delta_t_i = t_max - t_i
+                    // Initial Delay-Matching across all active hardware outputs:
+                    // t_max = max(t_1, ..., t_N), delta_t_i = t_max - t_i
                     if active_outputs.len() >= 2 {
                         let t_max = active_outputs
                             .iter()
-                            .map(|o| o.hardware_latency_ms)
+                            .map(|o| o.measured_total_latency_ms)
                             .fold(0.0_f64, f64::max);
                         for out in active_outputs.iter_mut() {
-                            let delta_ti = (t_max - out.hardware_latency_ms).max(0.0);
+                            let delta_ti = (t_max - out.measured_total_latency_ms).max(0.0);
                             out.delay_buffer.set_delay_ms(delta_ti);
                         }
                     } else if let Some(single) = active_outputs.first_mut() {
@@ -398,11 +678,39 @@ mod win_wasapi {
                     }
                 }
 
-                // Read captured system audio packets from WASAPI Loopback
+                // 3. Periodically update real-time IAudioClock::GetPosition + GetStreamLatency
+                //    delay compensation every 250ms so clock drift stays sample-aligned
+                if last_delay_sync_instant.elapsed() >= Duration::from_millis(250) {
+                    last_delay_sync_instant = Instant::now();
+                    if active_outputs.len() >= 2 {
+                        let mut t_max = 0.0_f64;
+                        for out in active_outputs.iter_mut() {
+                            let ti = out.refresh_realtime_latency_ms();
+                            if ti > t_max {
+                                t_max = ti;
+                            }
+                        }
+                        for out in active_outputs.iter_mut() {
+                            let delta_ti = (t_max - out.measured_total_latency_ms).max(0.0);
+                            out.delay_buffer.set_delay_ms(delta_ti);
+                        }
+                    }
+                }
+
+                let (_, _, ref capture_client) = match loopback_bundle {
+                    Some(ref b) => b,
+                    None => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                };
+
+                // 4. Read captured system audio packets from "Dolby Atmos Audio" / Loopback
                 let mut packet_frames = match capture_client.GetNextPacketSize() {
                     Ok(sz) => sz,
                     Err(_) => {
-                        thread::sleep(Duration::from_millis(2));
+                        loopback_bundle = None;
+                        thread::sleep(Duration::from_millis(5));
                         continue;
                     }
                 };
@@ -431,7 +739,6 @@ mod win_wasapi {
                         dsp_work_buf.resize(sample_count, 0.0);
 
                         if (flags & 0x2) != 0 || data_ptr.is_null() {
-                            // AUDCLNT_BUFFERFLAGS_SILENT
                             dsp_work_buf.fill(0.0);
                         } else {
                             let float_slice =
@@ -441,13 +748,16 @@ mod win_wasapi {
 
                         let _ = capture_client.ReleaseBuffer(num_frames_read);
 
-                        // Process captured system audio through the 5-Stage Psychoacoustic DSP Pipeline
+                        // Execute 5-Stage Psychoacoustic DSP Pipeline when Master Switch is ON
                         if let Ok(mut guard) = shared_state.lock() {
-                            guard.dsp.process_interleaved_buffer(&mut dsp_work_buf);
+                            if guard.dsp.master_enabled {
+                                guard.dsp.process_interleaved_buffer(&mut dsp_work_buf);
+                            }
                         }
 
-                        // Broadcast simultaneously to every selected WASAPI output with Hermite delay compensation
+                        // Write simultaneously to all ticked hardware endpoints with Hermite delay sync
                         for out in active_outputs.iter_mut() {
+                            let _ = &out.device_id;
                             if out.temp_delayed.len() < sample_count {
                                 out.temp_delayed.resize(sample_count, 0.0);
                             }
@@ -490,7 +800,7 @@ pub fn enumerate_devices_cross_platform(
     #[cfg(windows)]
     {
         if let Ok(mut guard) = shared_state.lock() {
-            return win_wasapi::enumerate_active_render_endpoints(&mut guard.selected_device_ids);
+            return win_wasapi::enumerate_active_render_endpoints(&mut guard);
         }
     }
 

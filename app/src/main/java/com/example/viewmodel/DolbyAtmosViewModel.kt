@@ -25,7 +25,7 @@ data class DolbyUiState(
     val editingMode: AudioMode = AudioMode.MUSIC,
     val profiles: Map<AudioMode, ModeProfileSettings> = defaultProfiles(),
     val hardwareEndpoints: List<HardwareAudioEndpoint> = emptyList(),
-    val selectedEndpointKeys: Set<String> = setOf(DolbyConstants.KEY_BUILTIN_SPEAKER),
+    val activeDeviceId: String = DolbyConstants.KEY_BUILTIN_SPEAKER,
     val showAddDeviceSheet: Boolean = false,
     val pairedBluetoothDevices: List<PairedBluetoothDeviceItem> = emptyList(),
     val connectingBluetoothAddress: String? = null,
@@ -99,14 +99,14 @@ class DolbyAtmosViewModel(application: Application) : AndroidViewModel(applicati
 
     init {
         val initialEndpoints = syncEngine.scanRealHardwareOutputDevices()
-        val initialSelectedKeys = initialEndpoints.filter { it.isSelected }.map { it.key }.toSet()
-            .ifEmpty { setOf(DolbyConstants.KEY_BUILTIN_SPEAKER) }
+        val initialActiveId = initialEndpoints.firstOrNull { it.isSelected }?.key
+            ?: DolbyConstants.KEY_BUILTIN_SPEAKER
         seenEndpointKeys.addAll(initialEndpoints.map { it.key })
 
         _uiState = MutableStateFlow(
             DolbyUiState(
                 hardwareEndpoints = initialEndpoints,
-                selectedEndpointKeys = initialSelectedKeys
+                activeDeviceId = initialActiveId
             )
         )
         uiState = _uiState.asStateFlow()
@@ -125,38 +125,42 @@ class DolbyAtmosViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     /**
-     * Rescans AudioManager outputs, MediaRouter2 routes, and BluetoothAdapter profiles
-     * (A2DP + HEADSET + LE_AUDIO + bondedDevices) so all connected Bluetooth devices
-     * and Loudspeakers appear simultaneously.
+     * Rescans AudioManager outputs and connected Bluetooth profiles (A2DP + HEADSET + LE_AUDIO).
+     * Automatically selects newly connected hardware or falls back to "Loudspeakers"
+     * (`DolbyConstants.KEY_BUILTIN_SPEAKER`) if the active Bluetooth or wired device disconnected.
      */
     fun refreshHardwareEndpoints() {
         _uiState.update { state ->
-            val rawScanned = syncEngine.scanRealHardwareOutputDevices(state.selectedEndpointKeys)
-            val updatedSelectedKeys = state.selectedEndpointKeys.toMutableSet()
+            val rawScanned = syncEngine.scanRealHardwareOutputDevices(state.activeDeviceId)
 
+            var nextActiveId = state.activeDeviceId
             for (ep in rawScanned) {
-                if (seenEndpointKeys.add(ep.key)) {
-                    updatedSelectedKeys.add(ep.key)
+                if (seenEndpointKeys.add(ep.key) && ep.key != DolbyConstants.KEY_BUILTIN_SPEAKER) {
+                    nextActiveId = ep.key
                 }
             }
 
-            if (updatedSelectedKeys.isEmpty()) {
-                updatedSelectedKeys.add(DolbyConstants.KEY_BUILTIN_SPEAKER)
+            if (rawScanned.none { it.key == nextActiveId }) {
+                nextActiveId = DolbyConstants.KEY_BUILTIN_SPEAKER
             }
 
-            val mergedEndpoints = rawScanned.map { ep ->
-                ep.copy(isSelected = updatedSelectedKeys.contains(ep.key))
+            val updatedEndpoints = rawScanned.map { ep ->
+                ep.copy(
+                    isSelected = (ep.key == nextActiveId),
+                    internalCompensatingDelayMs = 0f
+                )
             }
-            val synced = syncEngine.applySilentBackgroundDelaySynchronization(mergedEndpoints)
+            syncEngine.applyNativeSingleDeviceRouting(updatedEndpoints)
+
             val pairedList = if (state.showAddDeviceSheet) {
-                syncEngine.queryPairedAndConnectedBluetoothDevices(updatedSelectedKeys)
+                syncEngine.queryPairedAndConnectedBluetoothDevices(nextActiveId)
             } else {
                 state.pairedBluetoothDevices
             }
 
             val next = state.copy(
-                hardwareEndpoints = synced,
-                selectedEndpointKeys = updatedSelectedKeys,
+                hardwareEndpoints = updatedEndpoints,
+                activeDeviceId = nextActiveId,
                 pairedBluetoothDevices = pairedList
             )
             syncDspParametersWithState(next)
@@ -165,37 +169,40 @@ class DolbyAtmosViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     /**
-     * True Multi-Select toggle: smoothly updates the active routing profile via MediaRouter2
-     * and AudioDeviceInfo without any system casting dialogs or popups.
+     * Mutually Exclusive Single-Device Selection:
+     * Tapping any device sets it as the active output (`activeDeviceId = endpointKey`),
+     * marks its circle as ticked (#7BA7FF), unticks all other devices, and routes audio
+     * natively via AudioManager without any screen-casting dialogs.
      */
     fun toggleEndpointSelection(endpointKey: String) {
-        _uiState.update { state ->
-            val updatedKeys = state.selectedEndpointKeys.toMutableSet()
-            if (updatedKeys.contains(endpointKey)) {
-                updatedKeys.remove(endpointKey)
-            } else {
-                updatedKeys.add(endpointKey)
-            }
+        selectEndpoint(endpointKey)
+    }
 
-            if (updatedKeys.isEmpty()) {
-                val fallbackKey = state.hardwareEndpoints.firstOrNull()?.key
-                    ?: DolbyConstants.KEY_BUILTIN_SPEAKER
-                updatedKeys.add(fallbackKey)
+    fun selectEndpoint(endpointKey: String) {
+        _uiState.update { state ->
+            val targetId = if (state.hardwareEndpoints.any { it.key == endpointKey }) {
+                endpointKey
+            } else {
+                DolbyConstants.KEY_BUILTIN_SPEAKER
             }
 
             val updatedEndpoints = state.hardwareEndpoints.map { ep ->
-                ep.copy(isSelected = updatedKeys.contains(ep.key))
+                ep.copy(
+                    isSelected = (ep.key == targetId),
+                    internalCompensatingDelayMs = 0f
+                )
             }
-            val synced = syncEngine.applySilentBackgroundDelaySynchronization(updatedEndpoints)
+            syncEngine.applyNativeSingleDeviceRouting(updatedEndpoints)
+
             val pairedList = if (state.showAddDeviceSheet) {
-                syncEngine.queryPairedAndConnectedBluetoothDevices(updatedKeys)
+                syncEngine.queryPairedAndConnectedBluetoothDevices(targetId)
             } else {
                 state.pairedBluetoothDevices
             }
 
             val next = state.copy(
-                hardwareEndpoints = synced,
-                selectedEndpointKeys = updatedKeys,
+                hardwareEndpoints = updatedEndpoints,
+                activeDeviceId = targetId,
                 pairedBluetoothDevices = pairedList
             )
             syncDspParametersWithState(next)
@@ -205,8 +212,7 @@ class DolbyAtmosViewModel(application: Application) : AndroidViewModel(applicati
 
     fun openAddDeviceSheet() {
         _uiState.update { state ->
-            val currentKeys = state.selectedEndpointKeys
-            val paired = syncEngine.queryPairedAndConnectedBluetoothDevices(currentKeys)
+            val paired = syncEngine.queryPairedAndConnectedBluetoothDevices(state.activeDeviceId)
             state.copy(
                 showAddDeviceSheet = true,
                 pairedBluetoothDevices = paired,
@@ -232,20 +238,15 @@ class DolbyAtmosViewModel(application: Application) : AndroidViewModel(applicati
 
         syncEngine.connectToBluetoothDeviceInApp(address) { _, _ ->
             _uiState.update { state ->
-                val updatedKeys = state.selectedEndpointKeys.toMutableSet().apply {
-                    add(targetKey)
-                }
                 seenEndpointKeys.add(targetKey)
-
-                val scanned = syncEngine.scanRealHardwareOutputDevices(updatedKeys).map { ep ->
-                    ep.copy(isSelected = updatedKeys.contains(ep.key))
-                }
-                val synced = syncEngine.applySilentBackgroundDelaySynchronization(scanned)
-                val updatedPaired = syncEngine.queryPairedAndConnectedBluetoothDevices(updatedKeys)
+                val scanned = syncEngine.scanRealHardwareOutputDevices(targetKey)
+                val resolvedActiveId = scanned.firstOrNull { it.isSelected }?.key
+                    ?: DolbyConstants.KEY_BUILTIN_SPEAKER
+                val updatedPaired = syncEngine.queryPairedAndConnectedBluetoothDevices(resolvedActiveId)
 
                 val next = state.copy(
-                    hardwareEndpoints = synced,
-                    selectedEndpointKeys = updatedKeys,
+                    hardwareEndpoints = scanned,
+                    activeDeviceId = resolvedActiveId,
                     pairedBluetoothDevices = updatedPaired,
                     connectingBluetoothAddress = null
                 )

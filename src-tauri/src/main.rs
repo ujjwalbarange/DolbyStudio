@@ -32,6 +32,20 @@ fn set_selected_wasapi_devices(
 }
 
 #[tauri::command]
+fn set_device_relative_gain(
+    device_id: String,
+    relative_gain: f32,
+    state: State<'_, Arc<Mutex<SharedAudioEngineState>>>,
+) -> Result<(), String> {
+    if let Ok(mut guard) = state.lock() {
+        guard
+            .device_relative_gains
+            .insert(device_id, relative_gain.clamp(0.0, 1.0));
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn update_dsp_config(
     master_enabled: bool,
     mode: String,
@@ -65,6 +79,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_wasapi_devices,
             set_selected_wasapi_devices,
+            set_device_relative_gain,
             update_dsp_config
         ])
         .run(tauri::generate_context!())

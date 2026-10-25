@@ -33,11 +33,23 @@ class ExampleRobolectricTest {
 
         val endpoints = syncEngine.scanRealHardwareOutputDevices()
         assertTrue(endpoints.isNotEmpty())
+        assertEquals(1, endpoints.count { it.isSelected })
         assertTrue(endpoints.any { it.key == DolbyConstants.KEY_BUILTIN_SPEAKER && it.title == "Loudspeakers" && it.isSelected })
     }
 
     @Test
-    fun `verify silent background delay synchronization aligns selected multi-output endpoints to t_max`() {
+    fun `verify disconnected active bluetooth device automatically falls back to loudspeakers`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val dspEngine = PsychoacousticDspEngine()
+        val syncEngine = MultiDeviceSyncEngine(context, dspEngine)
+
+        val endpoints = syncEngine.scanRealHardwareOutputDevices(activeDeviceId = "bt_AA:BB:CC:11:22:33")
+        assertEquals(1, endpoints.count { it.isSelected })
+        assertEquals(DolbyConstants.KEY_BUILTIN_SPEAKER, endpoints.first { it.isSelected }.key)
+    }
+
+    @Test
+    fun `verify silent background delay synchronization aligns selected endpoints to t_max`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val dspEngine = PsychoacousticDspEngine()
         val syncEngine = MultiDeviceSyncEngine(context, dspEngine)

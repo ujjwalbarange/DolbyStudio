@@ -17,6 +17,7 @@ import {
   Plus,
   RotateCcw,
   Settings,
+  Volume2,
 } from "lucide-react";
 
 type MobileScreen = "HERO" | "SETTINGS" | "EDITOR";
@@ -113,7 +114,13 @@ export default function App() {
     try {
       const devices = await invoke<WasapiEndpoint[]>("get_wasapi_devices");
       if (devices && devices.length > 0) {
-        setEndpoints(devices);
+        setEndpoints(
+          devices.map((d) => ({
+            ...d,
+            relativeGain:
+              typeof d.relativeGain === "number" ? d.relativeGain : 1.0,
+          }))
+        );
         return;
       }
     } catch {
@@ -132,6 +139,9 @@ export default function App() {
           setEndpoints((prev) => {
             const selectedIds = new Set(
               prev.filter((p) => p.isSelected).map((p) => p.id)
+            );
+            const prevGains = new Map(
+              prev.map((p) => [p.id, p.relativeGain ?? 1.0])
             );
             return audioOutputs.map((out, idx) => {
               const id = out.deviceId || `default_${idx}`;
@@ -155,6 +165,7 @@ export default function App() {
                 isHeadphone,
                 isSelected:
                   selectedIds.size > 0 ? selectedIds.has(id) : idx === 0,
+                relativeGain: prevGains.get(id) ?? 1.0,
               };
             });
           });
@@ -176,6 +187,7 @@ export default function App() {
               isDefault: true,
               isHeadphone: false,
               isSelected: true,
+              relativeGain: 1.0,
             },
           ]
     );
@@ -243,6 +255,22 @@ export default function App() {
       );
       return safe;
     });
+  };
+
+  const handleUpdateEndpointRelativeGain = (
+    deviceId: string,
+    relativeGain: number
+  ) => {
+    const clamped = Math.max(0, Math.min(1, relativeGain));
+    setEndpoints((prev) =>
+      prev.map((ep) =>
+        ep.id === deviceId ? { ...ep, relativeGain: clamped } : ep
+      )
+    );
+    invoke("set_device_relative_gain", {
+      deviceId,
+      relativeGain: clamped,
+    }).catch(() => {});
   };
 
   const handleSelectMode = (mode: AudioModeId) => {
@@ -370,7 +398,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* Output Device Selector (Multi-Select Active Windows WASAPI Endpoints) */}
+            {/* Output Device Selector (Multi-Select Active Windows WASAPI Endpoints + Per-Device Volume Sliders) */}
             <div>
               <div className="flex items-center justify-between mb-2">
                 <span className="text-sm font-medium text-[#7BA7FF]">
@@ -378,22 +406,35 @@ export default function App() {
                 </span>
               </div>
 
-              <div className="space-y-1">
+              <div className="space-y-1.5">
                 {endpoints.map((ep) => (
                   <div
                     key={ep.id}
-                    onClick={() => handleToggleEndpoint(ep.id)}
-                    className="flex items-center gap-3.5 py-2.5 px-2 rounded-xl hover:bg-[#141923] cursor-pointer transition-colors"
+                    className="rounded-xl hover:bg-[#141923]/60 transition-colors"
                   >
-                    <SelectionDot selected={ep.isSelected} />
-                    <div className="flex-1 min-w-0">
-                      <div className="text-base font-medium text-[#F1F5F9] truncate">
-                        {ep.name}
-                      </div>
-                      <div className="text-xs text-[#94A3B8] truncate">
-                        {ep.description}
+                    <div
+                      onClick={() => handleToggleEndpoint(ep.id)}
+                      className="flex items-center gap-3.5 py-2.5 px-2 cursor-pointer"
+                    >
+                      <SelectionDot selected={ep.isSelected} />
+                      <div className="flex-1 min-w-0">
+                        <div className="text-base font-medium text-[#F1F5F9] truncate">
+                          {ep.name}
+                        </div>
+                        <div className="text-xs text-[#94A3B8] truncate">
+                          {ep.description}
+                        </div>
                       </div>
                     </div>
+
+                    {ep.isSelected && (
+                      <DeviceVolumeSlider
+                        gainScalar={ep.relativeGain ?? 1.0}
+                        onChange={(val) =>
+                          handleUpdateEndpointRelativeGain(ep.id, val)
+                        }
+                      />
+                    )}
                   </div>
                 ))}
 
@@ -551,22 +592,32 @@ export default function App() {
             <div className="text-sm font-medium text-[#7BA7FF] mb-2">
               Loudspeakers
             </div>
-            <div className="space-y-1">
+            <div className="space-y-1.5">
               {endpoints.map((ep) => (
-                <div
-                  key={ep.id}
-                  onClick={() => handleToggleEndpoint(ep.id)}
-                  className="flex items-center gap-4 py-3 cursor-pointer"
-                >
-                  <SelectionDot selected={ep.isSelected} />
-                  <div className="flex-1">
-                    <div className="text-xl font-medium text-[#F1F5F9]">
-                      {ep.name}
-                    </div>
-                    <div className="text-sm text-[#94A3B8]">
-                      {ep.description}
+                <div key={ep.id} className="py-1">
+                  <div
+                    onClick={() => handleToggleEndpoint(ep.id)}
+                    className="flex items-center gap-4 py-2 cursor-pointer"
+                  >
+                    <SelectionDot selected={ep.isSelected} />
+                    <div className="flex-1">
+                      <div className="text-xl font-medium text-[#F1F5F9]">
+                        {ep.name}
+                      </div>
+                      <div className="text-sm text-[#94A3B8]">
+                        {ep.description}
+                      </div>
                     </div>
                   </div>
+
+                  {ep.isSelected && (
+                    <DeviceVolumeSlider
+                      gainScalar={ep.relativeGain ?? 1.0}
+                      onChange={(val) =>
+                        handleUpdateEndpointRelativeGain(ep.id, val)
+                      }
+                    />
+                  )}
                 </div>
               ))}
 
@@ -656,8 +707,63 @@ export default function App() {
 }
 
 // ============================================================================
-// Subcomponents (Frequency Response Curve, 10-Band Vertical Pill Sliders, Rows)
+// Subcomponents (Per-Device Volume Slider, Frequency Curve, 10-Band EQ, Rows)
 // ============================================================================
+
+/**
+ * Sleek horizontal per-device relative volume slider (0% to 100%, default 100%)
+ * rendered directly below each checked output device.
+ */
+function DeviceVolumeSlider({
+  gainScalar,
+  onChange,
+}: {
+  gainScalar: number;
+  onChange: (val: number) => void;
+}) {
+  const trackRef = useRef<HTMLDivElement | null>(null);
+  const clamped = Math.max(0, Math.min(1, gainScalar));
+  const percent = Math.round(clamped * 100);
+
+  const updateFromClientX = (clientX: number) => {
+    const rect = trackRef.current?.getBoundingClientRect();
+    if (!rect || rect.width <= 0) return;
+    const relX = Math.max(0, Math.min(rect.width, clientX - rect.left));
+    onChange(relX / rect.width);
+  };
+
+  return (
+    <div
+      onClick={(e) => e.stopPropagation()}
+      className="pl-10 pr-2 pb-2.5 pt-0.5 flex items-center gap-3 select-none"
+    >
+      <Volume2 className="w-3.5 h-3.5 text-[#94A3B8] shrink-0" />
+      <div
+        ref={trackRef}
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          e.currentTarget.setPointerCapture(e.pointerId);
+          updateFromClientX(e.clientX);
+        }}
+        onPointerMove={(e) => {
+          if (e.buttons === 1) {
+            updateFromClientX(e.clientX);
+          }
+        }}
+        className="flex-1 h-2 rounded-full bg-[#141923] border border-[#1E2638] relative cursor-ew-resize overflow-hidden"
+        title={`Device output level: ${percent}%`}
+      >
+        <div
+          style={{ width: `${percent}%` }}
+          className="absolute inset-y-0 left-0 bg-[#7BA7FF] rounded-full transition-all duration-75"
+        />
+      </div>
+      <span className="text-xs font-medium text-[#94A3B8] w-9 text-right tabular-nums">
+        {percent}%
+      </span>
+    </div>
+  );
+}
 
 function RightEditorPane({
   mode,

@@ -21,6 +21,7 @@ export interface WasapiEndpoint {
   isDefault: boolean;
   isHeadphone: boolean;
   isSelected: boolean;
+  relativeGain?: number; // 0.0 (0%) to 1.0 (100%)
 }
 
 export interface ProfileSettings {

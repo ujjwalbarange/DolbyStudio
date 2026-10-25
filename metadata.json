@@ -1,0 +1,6 @@
+{
+  "name": "Dolby Atmos",
+  "description": "Dolby Atmos Mobile Psychoacoustic DSP Engine with 10-Band Cytomic SVF Equalizer, Dynamic IEQ, HRTF/Transaural Virtualiser, LUFS Volume Leveller, and Simultaneous Multi-Device Auto-Delay Synchronization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

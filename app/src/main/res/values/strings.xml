@@ -1,0 +1,37 @@
+<resources>
+    <string name="app_name">Dolby Atmos</string>
+    <string name="hero_title">Dolby Atmos</string>
+    <string name="hero_subtitle">Dolby Atmos delivers a premium listening experience through your phone\'s loudspeakers and connected devices.</string>
+    <string name="use_audio_effects">Use Audio effects</string>
+    <string name="learn_more">Learn more</string>
+    <string name="settings_title">Settings</string>
+    <string name="loudspeakers">Loudspeakers</string>
+    <string name="spatial_audio_section">Spatial audio</string>
+    <string name="spatial_audio_desc">Audio from compatible media becomes more immersive</string>
+    <string name="stereo_audio_section">Stereo audio</string>
+    <string name="smart_audio_title">Smart audio</string>
+    <string name="smart_audio_desc">Smart audio identifies the content and performs automatic adjustments to deliver the best sound</string>
+    <string name="music_title">Music</string>
+    <string name="music_desc">Rich, detailed audio that delivers every note and beat with power you can feel</string>
+    <string name="film_title">Film</string>
+    <string name="film_desc">Authentic surround sound and clearer dialogue for the full impact of films and TV shows</string>
+    <string name="game_title">Game</string>
+    <string name="game_desc">Surround sound and clearer dialogue for an immersive game experience</string>
+    <string name="podcast_title">Podcast</string>
+    <string name="podcast_desc">Boost dialogue for better speech clarity</string>
+    <string name="custom_title">Custom</string>
+    <string name="custom_desc">Advanced settings for your audio</string>
+    <string name="choose_equaliser">Choose equaliser</string>
+    <string name="eq_manual">Manual</string>
+    <string name="eq_brilliant_treble">Brilliant treble</string>
+    <string name="eq_bass_boost">Bass boost</string>
+    <string name="eq_vocal_boost">Vocal boost</string>
+    <string name="eq_flat">Flat</string>
+    <string name="profile_settings">Profile settings</string>
+    <string name="surround_virtualiser">Surround virtualiser</string>
+    <string name="surround_virtualiser_desc">Create a surround sound experience through your connected device</string>
+    <string name="volume_leveller">Volume leveller</string>
+    <string name="volume_leveller_desc">Hear the same volume level for each audio source</string>
+    <string name="bass_label">Bass</string>
+    <string name="treble_label">Treble</string>
+</resources>

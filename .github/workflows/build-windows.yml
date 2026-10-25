@@ -7,6 +7,9 @@ on:
     branches: [ "main", "master" ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -27,24 +30,18 @@ jobs:
       - name: Install Frontend Dependencies
         run: npm install
 
-      - name: Build Desktop Application (.exe)
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: v__VERSION__
-          releaseName: 'Dolby Atmos PC v__VERSION__'
-          releaseBody: 'Automated Windows build output.'
-          releaseDraft: false
-          prerelease: false
+      - name: Build Desktop Application (.exe & .msi)
+        run: npm run tauri build
 
       - name: Locate and Collect Executables
         id: collect_artifacts
         shell: bash
         run: |
           mkdir -p output_exe
+          if [ -f "src-tauri/target/release/dolby-atmos-pc.exe" ]; then
+            cp "src-tauri/target/release/dolby-atmos-pc.exe" output_exe/
+          fi
           find src-tauri/target/release/bundle/ -type f \( -name "*.exe" -o -name "*.msi" \) -exec cp {} output_exe/ \; || true
-          find target/release/bundle/ -type f \( -name "*.exe" -o -name "*.msi" \) -exec cp {} output_exe/ \; || true
           ls -la output_exe
 
       - name: Upload Windows Executable Artifact

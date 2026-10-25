@@ -7,9 +7,11 @@ import com.example.dsp.MultiDeviceSyncEngine
 import com.example.dsp.PsychoacousticDspEngine
 import com.example.model.AppScreen
 import com.example.model.AudioMode
+import com.example.model.DolbyConstants
 import com.example.model.EqualiserPreset
 import com.example.model.HardwareAudioEndpoint
 import com.example.model.ModeProfileSettings
+import com.example.model.PairedBluetoothDeviceItem
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -23,6 +25,11 @@ data class DolbyUiState(
     val editingMode: AudioMode = AudioMode.MUSIC,
     val profiles: Map<AudioMode, ModeProfileSettings> = defaultProfiles(),
     val hardwareEndpoints: List<HardwareAudioEndpoint> = emptyList(),
+    val selectedEndpointKeys: Set<String> = setOf(DolbyConstants.KEY_BUILTIN_SPEAKER),
+    val showAddDeviceSheet: Boolean = false,
+    val pairedBluetoothDevices: List<PairedBluetoothDeviceItem> = emptyList(),
+    val connectingBluetoothAddress: String? = null,
+    val isMultiOutputCaptureActive: Boolean = false,
     val effectiveIeqBandsDb: List<Float> = List(10) { 0f }
 ) {
     val activeProfile: ModeProfileSettings
@@ -86,17 +93,31 @@ class DolbyAtmosViewModel(application: Application) : AndroidViewModel(applicati
     private val syncEngine = MultiDeviceSyncEngine(application.applicationContext, dspEngine)
     private var deviceCallback: AudioDeviceCallback? = null
 
-    private val _uiState = MutableStateFlow(
-        DolbyUiState(
-            hardwareEndpoints = syncEngine.scanRealHardwareOutputDevices()
-        )
-    )
-    val uiState: StateFlow<DolbyUiState> = _uiState.asStateFlow()
+    // Tracks keys we have already seen so newly connected BT devices default to ticked ON
+    // without ever auto-unchecking Loudspeakers or overriding user manual deselections.
+    private val seenEndpointKeys = mutableSetOf<String>()
+
+    private val _uiState: MutableStateFlow<DolbyUiState>
+    val uiState: StateFlow<DolbyUiState>
 
     init {
+        val initialEndpoints = syncEngine.scanRealHardwareOutputDevices()
+        val initialSelectedKeys = initialEndpoints.filter { it.isSelected }.map { it.key }.toSet()
+            .ifEmpty { setOf(DolbyConstants.KEY_BUILTIN_SPEAKER) }
+        seenEndpointKeys.addAll(initialEndpoints.map { it.key })
+
+        _uiState = MutableStateFlow(
+            DolbyUiState(
+                hardwareEndpoints = initialEndpoints,
+                selectedEndpointKeys = initialSelectedKeys,
+                isMultiOutputCaptureActive = syncEngine.isMediaProjectionActive()
+            )
+        )
+        uiState = _uiState.asStateFlow()
+
         syncDspParametersWithState(_uiState.value)
 
-        // Register real-time hardware connection / disconnection callback
+        // Register real-time hardware connection / disconnection + Bluetooth profile listener
         deviceCallback = syncEngine.registerDeviceCallback {
             refreshHardwareEndpoints()
         }
@@ -108,34 +129,155 @@ class DolbyAtmosViewModel(application: Application) : AndroidViewModel(applicati
         syncEngine.release()
     }
 
+    /**
+     * Rescans both AudioManager outputs and BluetoothAdapter (A2DP + HEADSET + LE_AUDIO + bondedDevices)
+     * so all connected Bluetooth devices (e.g., "AirLits 7" and "pTron BT") and "Loudspeakers"
+     * appear simultaneously.
+     */
     fun refreshHardwareEndpoints() {
         _uiState.update { state ->
-            val currentSelectedIds = state.hardwareEndpoints
-                .filter { it.isSelected }
-                .map { it.deviceId }
-                .toSet()
-            val scanned = syncEngine.scanRealHardwareOutputDevices(currentSelectedIds)
-            val next = state.copy(hardwareEndpoints = scanned)
+            val rawScanned = syncEngine.scanRealHardwareOutputDevices(state.selectedEndpointKeys)
+            val updatedSelectedKeys = state.selectedEndpointKeys.toMutableSet()
+
+            // Any newly discovered connected Bluetooth or wired device defaults to selected=true
+            // while preserving existing selections (never auto-unchecking Loudspeakers).
+            for (ep in rawScanned) {
+                if (seenEndpointKeys.add(ep.key)) {
+                    updatedSelectedKeys.add(ep.key)
+                }
+            }
+
+            if (updatedSelectedKeys.isEmpty()) {
+                updatedSelectedKeys.add(DolbyConstants.KEY_BUILTIN_SPEAKER)
+            }
+
+            val mergedEndpoints = rawScanned.map { ep ->
+                ep.copy(isSelected = updatedSelectedKeys.contains(ep.key))
+            }
+            val synced = syncEngine.applySilentBackgroundDelaySynchronization(mergedEndpoints)
+            val pairedList = if (state.showAddDeviceSheet) {
+                syncEngine.queryPairedAndConnectedBluetoothDevices(updatedSelectedKeys)
+            } else {
+                state.pairedBluetoothDevices
+            }
+
+            val next = state.copy(
+                hardwareEndpoints = synced,
+                selectedEndpointKeys = updatedSelectedKeys,
+                pairedBluetoothDevices = pairedList,
+                isMultiOutputCaptureActive = syncEngine.isMediaProjectionActive()
+            )
             syncDspParametersWithState(next)
             next
         }
     }
 
-    fun toggleEndpointSelection(deviceId: Int) {
+    /**
+     * True Multi-Select toggle: allows ticking 1, 2, 3, or more output devices simultaneously
+     * (e.g., Loudspeakers + pTron BT + AirLits 7). Ticking a Bluetooth device never unchecks Loudspeakers.
+     */
+    fun toggleEndpointSelection(endpointKey: String) {
         _uiState.update { state ->
-            val updated = state.hardwareEndpoints.map { ep ->
-                if (ep.deviceId == deviceId) ep.copy(isSelected = !ep.isSelected) else ep
-            }
-            // Keep at least one output active
-            val safeList = if (updated.none { it.isSelected }) {
-                updated.mapIndexed { idx, ep -> if (idx == 0) ep.copy(isSelected = true) else ep }
+            val updatedKeys = state.selectedEndpointKeys.toMutableSet()
+            if (updatedKeys.contains(endpointKey)) {
+                updatedKeys.remove(endpointKey)
             } else {
-                updated
+                updatedKeys.add(endpointKey)
             }
-            val synced = syncEngine.applySilentBackgroundDelaySynchronization(safeList)
-            val next = state.copy(hardwareEndpoints = synced)
+
+            // Keep at least one output active so audio is never orphaned
+            if (updatedKeys.isEmpty()) {
+                val fallbackKey = state.hardwareEndpoints.firstOrNull()?.key
+                    ?: DolbyConstants.KEY_BUILTIN_SPEAKER
+                updatedKeys.add(fallbackKey)
+            }
+
+            val updatedEndpoints = state.hardwareEndpoints.map { ep ->
+                ep.copy(isSelected = updatedKeys.contains(ep.key))
+            }
+            val synced = syncEngine.applySilentBackgroundDelaySynchronization(updatedEndpoints)
+            val pairedList = if (state.showAddDeviceSheet) {
+                syncEngine.queryPairedAndConnectedBluetoothDevices(updatedKeys)
+            } else {
+                state.pairedBluetoothDevices
+            }
+
+            val next = state.copy(
+                hardwareEndpoints = synced,
+                selectedEndpointKeys = updatedKeys,
+                pairedBluetoothDevices = pairedList,
+                isMultiOutputCaptureActive = syncEngine.isMediaProjectionActive()
+            )
             syncDspParametersWithState(next)
             next
+        }
+    }
+
+    /**
+     * Opens the In-App "+ Add device" Modal Bottom Sheet listing all Connected and Saved/Paired
+     * Bluetooth devices directly inside the app without redirecting to Android Settings.
+     */
+    fun openAddDeviceSheet() {
+        _uiState.update { state ->
+            val currentKeys = state.selectedEndpointKeys
+            val paired = syncEngine.queryPairedAndConnectedBluetoothDevices(currentKeys)
+            state.copy(
+                showAddDeviceSheet = true,
+                pairedBluetoothDevices = paired,
+                connectingBluetoothAddress = null
+            )
+        }
+    }
+
+    fun dismissAddDeviceSheet() {
+        _uiState.update { state ->
+            state.copy(
+                showAddDeviceSheet = false,
+                connectingBluetoothAddress = null
+            )
+        }
+    }
+
+    /**
+     * Connects to a Paired/Saved or Connected Bluetooth device tapped inside the In-App
+     * "+ Add device" bottom sheet, adds it to the active output list under Loudspeakers,
+     * and ticks it ON (`isSelected = true`) automatically.
+     */
+    fun connectAndSelectBluetoothDeviceFromSheet(address: String) {
+        val targetKey = "bt_$address"
+        _uiState.update { state ->
+            state.copy(connectingBluetoothAddress = address)
+        }
+
+        syncEngine.connectToBluetoothDeviceInApp(address) { _, _ ->
+            _uiState.update { state ->
+                val updatedKeys = state.selectedEndpointKeys.toMutableSet().apply {
+                    add(targetKey)
+                }
+                seenEndpointKeys.add(targetKey)
+
+                val scanned = syncEngine.scanRealHardwareOutputDevices(updatedKeys).map { ep ->
+                    ep.copy(isSelected = updatedKeys.contains(ep.key))
+                }
+                val synced = syncEngine.applySilentBackgroundDelaySynchronization(scanned)
+                val updatedPaired = syncEngine.queryPairedAndConnectedBluetoothDevices(updatedKeys)
+
+                val next = state.copy(
+                    hardwareEndpoints = synced,
+                    selectedEndpointKeys = updatedKeys,
+                    pairedBluetoothDevices = updatedPaired,
+                    connectingBluetoothAddress = null,
+                    isMultiOutputCaptureActive = syncEngine.isMediaProjectionActive()
+                )
+                syncDspParametersWithState(next)
+                next
+            }
+        }
+    }
+
+    fun onMediaProjectionStateChanged() {
+        _uiState.update { state ->
+            state.copy(isMultiOutputCaptureActive = syncEngine.isMediaProjectionActive())
         }
     }
 

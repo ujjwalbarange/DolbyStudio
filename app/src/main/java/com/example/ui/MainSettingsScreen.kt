@@ -1,8 +1,11 @@
 package com.example.ui
 
 import android.Manifest
+import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.provider.Settings
 import androidx.activity.compose.BackHandler
@@ -10,6 +13,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -18,18 +22,26 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -42,24 +54,37 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.example.R
+import com.example.dsp.MultiOutputPlaybackService
 import com.example.model.AudioMode
+import com.example.model.DolbyConstants
 import com.example.model.HardwareAudioEndpoint
+import com.example.model.PairedBluetoothDeviceItem
 import com.example.ui.components.DolbySelectionIndicator
 import com.example.ui.components.DolbyTopBar
 import com.example.ui.theme.DolbyAccentLightBlue
 import com.example.ui.theme.DolbyDivider
 import com.example.ui.theme.DolbyObsidianBg
 import com.example.ui.theme.DolbySectionHeaderBlue
+import com.example.ui.theme.DolbySurfaceElevated
 import com.example.ui.theme.DolbyTextPrimary
 
 private val SubtitleSlateColor = Color(0xFF94A3B8)
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainSettingsScreen(
     selectedMode: AudioMode,
     hardwareEndpoints: List<HardwareAudioEndpoint>,
-    onToggleEndpoint: (Int) -> Unit,
+    showAddDeviceSheet: Boolean = false,
+    pairedBluetoothDevices: List<PairedBluetoothDeviceItem> = emptyList(),
+    connectingBluetoothAddress: String? = null,
+    isMultiOutputCaptureActive: Boolean = false,
+    onToggleEndpoint: (String) -> Unit,
     onRescanHardwareEndpoints: () -> Unit,
+    onOpenAddDeviceSheet: () -> Unit = {},
+    onDismissAddDeviceSheet: () -> Unit = {},
+    onConnectBluetoothDevice: (String) -> Unit = {},
+    onMediaProjectionStateChanged: () -> Unit = {},
     onSelectMode: (AudioMode) -> Unit,
     onEditModeClick: (AudioMode) -> Unit,
     onBackClick: () -> Unit,
@@ -68,39 +93,86 @@ fun MainSettingsScreen(
     BackHandler(onBack = onBackClick)
 
     val context = LocalContext.current
-    val btPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) {
-        onRescanHardwareEndpoints()
-        try {
-            context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            })
-        } catch (_: Exception) {}
+
+    // MediaProjection launcher for simultaneous Phone Loudspeakers + Bluetooth audio capture & routing
+    val mediaProjectionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+            MultiOutputPlaybackService.startWithProjection(
+                context = context,
+                resultCode = result.resultCode,
+                resultData = result.data!!
+            )
+            onMediaProjectionStateChanged()
+        }
     }
 
-    val handleAddDeviceClick = {
+    val requestMultiDeviceCaptureIfNeeded = {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && !isMultiOutputCaptureActive) {
+            try {
+                val projectionManager = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE)
+                    as? MediaProjectionManager
+                val captureIntent = projectionManager?.createScreenCaptureIntent()
+                if (captureIntent != null) {
+                    mediaProjectionLauncher.launch(captureIntent)
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    // Bluetooth permission launcher for Android 12+ (BLUETOOTH_CONNECT + BLUETOOTH_SCAN)
+    val btPermissionsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) {
         onRescanHardwareEndpoints()
+        onOpenAddDeviceSheet()
+    }
+
+    // Clicking "+ Add device" opens the In-App Bluetooth Device Picker Bottom Sheet
+    // (never redirects directly to Android Settings!)
+    val handleAddDeviceClick = {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val hasBtConnect = ContextCompat.checkSelfPermission(
                 context,
                 Manifest.permission.BLUETOOTH_CONNECT
             ) == PackageManager.PERMISSION_GRANTED
-            if (!hasBtConnect) {
-                btPermissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
+            val hasBtScan = ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.BLUETOOTH_SCAN
+            ) == PackageManager.PERMISSION_GRANTED
+
+            if (!hasBtConnect || !hasBtScan) {
+                btPermissionsLauncher.launch(
+                    arrayOf(
+                        Manifest.permission.BLUETOOTH_CONNECT,
+                        Manifest.permission.BLUETOOTH_SCAN
+                    )
+                )
             } else {
-                try {
-                    context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS).apply {
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    })
-                } catch (_: Exception) {}
+                onRescanHardwareEndpoints()
+                onOpenAddDeviceSheet()
             }
         } else {
-            try {
-                context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                })
-            } catch (_: Exception) {}
+            onRescanHardwareEndpoints()
+            onOpenAddDeviceSheet()
+        }
+    }
+
+    val handleEndpointToggle: (HardwareAudioEndpoint) -> Unit = { endpoint ->
+        val willBeSelected = !endpoint.isSelected
+        val currentlySelectedCount = hardwareEndpoints.count { it.isSelected }
+        val newSelectedCount = if (willBeSelected) currentlySelectedCount + 1 else currentlySelectedCount - 1
+
+        onToggleEndpoint(endpoint.key)
+
+        // If user is ticking multiple output devices simultaneously (e.g. Loudspeakers + Bluetooth
+        // or 2+ Bluetooth devices), start simultaneous audio capture if not already active
+        val hasBtConnected = hardwareEndpoints.any { it.key.startsWith("bt_") }
+        val isCombiningSpeakerAndBt = hasBtConnected &&
+            (newSelectedCount >= 2 || (endpoint.key == DolbyConstants.KEY_BUILTIN_SPEAKER && willBeSelected))
+        if (newSelectedCount >= 2 && isCombiningSpeakerAndBt) {
+            requestMultiDeviceCaptureIfNeeded()
         }
     }
 
@@ -145,12 +217,12 @@ fun MainSettingsScreen(
                 )
             }
 
-            // Detected Real Hardware Output Devices (Clean row layout matching Spatial/Stereo modes)
+            // Detected Real Hardware Output Devices (Multi-Select: Loudspeakers + All Connected BT Devices)
             items(hardwareEndpoints.size) { idx ->
                 val endpoint = hardwareEndpoints[idx]
                 HardwareOutputRow(
                     endpoint = endpoint,
-                    onToggle = { onToggleEndpoint(endpoint.deviceId) }
+                    onToggle = { handleEndpointToggle(endpoint) }
                 )
             }
 
@@ -234,6 +306,174 @@ fun MainSettingsScreen(
                     onEditClick = if (mode.hasEditor) {
                         { onEditModeClick(mode) }
                     } else null
+                )
+            }
+        }
+    }
+
+    // In-App Device Picker Modal Bottom Sheet (Never forces user to leave app for paired BT devices)
+    if (showAddDeviceSheet) {
+        val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        ModalBottomSheet(
+            onDismissRequest = onDismissAddDeviceSheet,
+            sheetState = sheetState,
+            containerColor = DolbySurfaceElevated,
+            contentColor = DolbyTextPrimary,
+            shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
+            modifier = Modifier.testTag("add_device_bottom_sheet")
+        ) {
+            AddBluetoothDeviceBottomSheetContent(
+                pairedDevices = pairedBluetoothDevices,
+                connectingAddress = connectingBluetoothAddress,
+                onSelectDevice = { item ->
+                    onConnectBluetoothDevice(item.address)
+                    val selectedAfterConnect = hardwareEndpoints.count { it.isSelected } + 1
+                    if (selectedAfterConnect >= 2) {
+                        requestMultiDeviceCaptureIfNeeded()
+                    }
+                },
+                onPairBrandNewDevice = {
+                    onDismissAddDeviceSheet()
+                    try {
+                        context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS).apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        })
+                    } catch (_: Exception) {}
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun AddBluetoothDeviceBottomSheetContent(
+    pairedDevices: List<PairedBluetoothDeviceItem>,
+    connectingAddress: String?,
+    onSelectDevice: (PairedBluetoothDeviceItem) -> Unit,
+    onPairBrandNewDevice: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 28.dp)
+    ) {
+        Text(
+            text = "Connect audio device",
+            color = DolbyTextPrimary,
+            fontSize = 22.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp)
+        )
+
+        Text(
+            text = "Tap any connected or saved Bluetooth device to add and enable simultaneous output",
+            color = SubtitleSlateColor,
+            fontSize = 14.sp,
+            lineHeight = 20.sp,
+            modifier = Modifier.padding(start = 24.dp, end = 24.dp, bottom = 16.dp)
+        )
+
+        HorizontalDivider(color = DolbyDivider, thickness = 1.dp)
+
+        if (pairedDevices.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 24.dp, vertical = 28.dp),
+                contentAlignment = Alignment.CenterStart
+            ) {
+                Text(
+                    text = "No paired Bluetooth audio devices found on this phone yet. Tap below to pair a new Bluetooth speaker or earphones.",
+                    color = SubtitleSlateColor,
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp
+                )
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 360.dp)
+            ) {
+                items(pairedDevices.size) { idx ->
+                    val item = pairedDevices[idx]
+                    val isConnecting = (connectingAddress == item.address)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onSelectDevice(item) }
+                            .padding(start = 16.dp, end = 24.dp, top = 12.dp, bottom = 12.dp)
+                            .testTag("sheet_bt_device_${item.address}"),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        DolbySelectionIndicator(
+                            selected = item.isSelectedInOutputList,
+                            onClick = { onSelectDevice(item) }
+                        )
+
+                        Spacer(modifier = Modifier.width(8.dp))
+
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = item.name,
+                                color = DolbyTextPrimary,
+                                fontSize = 18.sp,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = when {
+                                    isConnecting -> "Connecting Bluetooth audio..."
+                                    item.isConnected && item.isSelectedInOutputList -> "Connected • Active in multi-output"
+                                    item.isConnected -> "Connected • Tap to tick in output list"
+                                    else -> "Saved device • Tap to connect & tick"
+                                },
+                                color = if (item.isConnected) DolbySectionHeaderBlue else SubtitleSlateColor,
+                                fontSize = 13.sp
+                            )
+                        }
+
+                        if (isConnecting) {
+                            CircularProgressIndicator(
+                                color = DolbySectionHeaderBlue,
+                                strokeWidth = 2.dp,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        HorizontalDivider(
+            color = DolbyDivider,
+            thickness = 1.dp,
+            modifier = Modifier.padding(top = 8.dp)
+        )
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            TextButton(
+                onClick = onPairBrandNewDevice,
+                modifier = Modifier.testTag("pair_brand_new_device_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Add,
+                    contentDescription = null,
+                    tint = DolbySectionHeaderBlue,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "Pair a brand new device",
+                    color = DolbySectionHeaderBlue,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Medium
                 )
             }
         }

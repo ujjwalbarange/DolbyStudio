@@ -94,19 +94,36 @@ data class ModeProfileSettings(
 )
 
 /**
- * Represents a real physical audio output endpoint reported by Android AudioManager.
- * Latency fields are used strictly by the silent background delay synchronization engine
- * and are never displayed in the UI.
+ * Represents a real physical audio output endpoint (Phone Loudspeakers, Wired/USB Headset,
+ * or any connected Bluetooth A2DP/HFP/LE Audio device).
+ *
+ * Uses a stable unique `key` (e.g. "builtin_speaker" or "bt_<MAC_ADDRESS>") so multiple
+ * connected Bluetooth devices and Phone Loudspeakers can all be displayed and multi-selected
+ * simultaneously even when Android's AudioManager only marks one A2DP device as "Active".
  */
 data class HardwareAudioEndpoint(
+    val key: String,
     val deviceId: Int,
     val title: String,
     val subtitle: String,
     val androidDeviceType: Int,
+    val bluetoothAddress: String? = null,
     val isHeadphoneBinaural: Boolean,
     val isSelected: Boolean,
     internal val internalHardwareLatencyMs: Float = 0f,
     internal val internalCompensatingDelayMs: Float = 0f
+)
+
+/**
+ * Represents a paired/bonded or connected Bluetooth audio device shown in the In-App
+ * "+ Add device" Bottom Sheet picker.
+ */
+data class PairedBluetoothDeviceItem(
+    val address: String,
+    val name: String,
+    val isConnected: Boolean,
+    val isSelectedInOutputList: Boolean,
+    val isConnecting: Boolean = false
 )
 
 object DolbyConstants {
@@ -117,4 +134,5 @@ object DolbyConstants {
         "31.5", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"
     )
     const val SAMPLE_RATE = 48000.0
+    const val KEY_BUILTIN_SPEAKER = "builtin_speaker"
 }

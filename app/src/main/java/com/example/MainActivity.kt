@@ -1,9 +1,14 @@
 package com.example
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
@@ -16,10 +21,17 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.model.AppScreen
@@ -48,6 +60,57 @@ fun DolbyAtmosApp(
     viewModel: DolbyAtmosViewModel = viewModel()
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    // Request BLUETOOTH_CONNECT & BLUETOOTH_SCAN on startup (Android 12+) so bondedDevices
+    // and connectedDevices (e.g., AirLits 7 + pTron BT) are discovered immediately.
+    val startupBtPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        viewModel.refreshHardwareEndpoints()
+    }
+
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val missingPermissions = buildList {
+                if (ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.BLUETOOTH_CONNECT
+                    ) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    add(Manifest.permission.BLUETOOTH_CONNECT)
+                }
+                if (ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.BLUETOOTH_SCAN
+                    ) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    add(Manifest.permission.BLUETOOTH_SCAN)
+                }
+            }
+            if (missingPermissions.isNotEmpty()) {
+                startupBtPermissionLauncher.launch(missingPermissions.toTypedArray())
+            } else {
+                viewModel.refreshHardwareEndpoints()
+            }
+        } else {
+            viewModel.refreshHardwareEndpoints()
+        }
+    }
+
+    // Refresh Bluetooth and hardware endpoints whenever returning to foreground
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                viewModel.refreshHardwareEndpoints()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
 
     Scaffold(
         modifier = Modifier
@@ -86,8 +149,16 @@ fun DolbyAtmosApp(
                             MainSettingsScreen(
                                 selectedMode = uiState.selectedMode,
                                 hardwareEndpoints = uiState.hardwareEndpoints,
+                                showAddDeviceSheet = uiState.showAddDeviceSheet,
+                                pairedBluetoothDevices = uiState.pairedBluetoothDevices,
+                                connectingBluetoothAddress = uiState.connectingBluetoothAddress,
+                                isMultiOutputCaptureActive = uiState.isMultiOutputCaptureActive,
                                 onToggleEndpoint = { viewModel.toggleEndpointSelection(it) },
                                 onRescanHardwareEndpoints = { viewModel.refreshHardwareEndpoints() },
+                                onOpenAddDeviceSheet = { viewModel.openAddDeviceSheet() },
+                                onDismissAddDeviceSheet = { viewModel.dismissAddDeviceSheet() },
+                                onConnectBluetoothDevice = { viewModel.connectAndSelectBluetoothDeviceFromSheet(it) },
+                                onMediaProjectionStateChanged = { viewModel.onMediaProjectionStateChanged() },
                                 onSelectMode = { viewModel.selectAudioMode(it) },
                                 onEditModeClick = { viewModel.openModeEditor(it) },
                                 onBackClick = { viewModel.navigateBack() }

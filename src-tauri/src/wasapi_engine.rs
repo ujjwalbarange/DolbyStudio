@@ -36,19 +36,18 @@ mod win_wasapi {
     use std::ptr;
     use std::slice;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tauri::{AppHandle, Emitter};
-    use windows::core::{implement, Interface, GUID, HRESULT, PCWSTR, PWSTR};
+    use windows::core::PWSTR;
     use windows::Win32::Devices::FunctionDiscovery::{
         PKEY_Device_DeviceDesc, PKEY_Device_FriendlyName,
     };
-    use windows::Win32::Foundation::PROPERTYKEY;
     use windows::Win32::Media::Audio::{
         eConsole, eRender, IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDevice,
-        IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Impl, MMDeviceEnumerator,
-        AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
-        AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, DEVICE_STATE,
-        DEVICE_STATE_ACTIVE, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
+        IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
+        AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
+        WAVEFORMATEXTENSIBLE,
     };
     use windows::Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE;
     use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
@@ -57,42 +56,7 @@ mod win_wasapi {
         CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED,
         STGM_READ,
     };
-
-    #[implement(IMMNotificationClient)]
-    struct HotplugNotificationClient {
-        app_handle: AppHandle,
-    }
-
-    impl IMMNotificationClient_Impl for HotplugNotificationClient_Impl {
-        fn OnDeviceStateChanged(&self, _pwstrdeviceid: &PCWSTR, _dwnewstate: DEVICE_STATE) -> windows::core::Result<()> {
-            let _ = self.app_handle.emit("wasapi-devices-changed", ());
-            Ok(())
-        }
-
-        fn OnDeviceAdded(&self, _pwstrdeviceid: &PCWSTR) -> windows::core::Result<()> {
-            let _ = self.app_handle.emit("wasapi-devices-changed", ());
-            Ok(())
-        }
-
-        fn OnDeviceRemoved(&self, _pwstrdeviceid: &PCWSTR) -> windows::core::Result<()> {
-            let _ = self.app_handle.emit("wasapi-devices-changed", ());
-            Ok(())
-        }
-
-        fn OnDefaultDeviceChanged(
-            &self,
-            _flow: windows::Win32::Media::Audio::EDataFlow,
-            _role: windows::Win32::Media::Audio::ERole,
-            _pwstrdefaultdeviceid: &PCWSTR,
-        ) -> windows::core::Result<()> {
-            let _ = self.app_handle.emit("wasapi-devices-changed", ());
-            Ok(())
-        }
-
-        fn OnPropertyValueChanged(&self, _pwstrdeviceid: &PCWSTR, _key: &PROPERTYKEY) -> windows::core::Result<()> {
-            Ok(())
-        }
-    }
+    use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
 
     unsafe fn pwstr_to_string(ptr: PWSTR) -> String {
         if ptr.is_null() {
@@ -117,6 +81,25 @@ mod win_wasapi {
         } else {
             Some(value.trim().to_string())
         }
+    }
+
+    unsafe fn collect_active_endpoint_ids(enumerator: &IMMDeviceEnumerator) -> Vec<String> {
+        let collection = match enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        let count = collection.GetCount().unwrap_or(0);
+        let mut ids = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            if let Ok(device) = collection.Item(i) {
+                if let Ok(raw) = device.GetId() {
+                    let s = pwstr_to_string(raw);
+                    CoTaskMemFree(Some(raw.0 as *const _));
+                    ids.push(s);
+                }
+            }
+        }
+        ids
     }
 
     pub fn enumerate_active_render_endpoints(
@@ -204,7 +187,7 @@ mod win_wasapi {
     }
 
     struct ActiveWasapiOutputStream {
-        device_id: String,
+        _device_id: String,
         audio_client: IAudioClient,
         render_client: IAudioRenderClient,
         buffer_frames: u32,
@@ -251,12 +234,6 @@ mod win_wasapi {
                     Err(_) => return,
                 };
 
-            let notif_client: IMMNotificationClient = HotplugNotificationClient {
-                app_handle: app_handle.clone(),
-            }
-            .into();
-            let _ = enumerator.RegisterEndpointNotificationCallback(&notif_client);
-
             let desired_wfx = build_48k_float_stereo_format();
             let wfx_ptr = &desired_wfx.Format as *const WAVEFORMATEX;
 
@@ -299,8 +276,20 @@ mod win_wasapi {
 
             let mut active_outputs: Vec<ActiveWasapiOutputStream> = Vec::new();
             let mut dsp_work_buf: Vec<f32> = Vec::with_capacity(4096);
+            let mut known_endpoint_ids = collect_active_endpoint_ids(&enumerator);
+            let mut last_hotplug_poll = Instant::now();
 
             loop {
+                // Poll for hardware hotplug changes every 750ms and notify UI
+                if last_hotplug_poll.elapsed() >= Duration::from_millis(750) {
+                    last_hotplug_poll = Instant::now();
+                    let current_ids = collect_active_endpoint_ids(&enumerator);
+                    if current_ids != known_endpoint_ids {
+                        known_endpoint_ids = current_ids;
+                        let _ = app_handle.emit("wasapi-devices-changed", ());
+                    }
+                }
+
                 // Check if user changed selected output devices
                 let should_rebuild = {
                     if let Ok(mut guard) = shared_state.lock() {
@@ -377,7 +366,7 @@ mod win_wasapi {
 
                                             let _ = render_audio_client.Start();
                                             active_outputs.push(ActiveWasapiOutputStream {
-                                                device_id: dev_id,
+                                                _device_id: dev_id,
                                                 audio_client: render_audio_client,
                                                 render_client,
                                                 buffer_frames: buf_frames,

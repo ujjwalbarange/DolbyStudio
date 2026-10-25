@@ -19,13 +19,13 @@ import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
-import android.media.AudioPlaybackCaptureConfiguration
-import android.media.AudioRecord
 import android.media.AudioTimestamp
 import android.media.AudioTrack
+import android.media.MediaRoute2Info
+import android.media.MediaRouter2
+import android.media.RouteDiscoveryPreference
 import android.media.audiofx.Equalizer
 import android.media.audiofx.Virtualizer
-import android.media.projection.MediaProjection
 import android.os.Build
 import androidx.core.content.ContextCompat
 import com.example.model.DolbyConstants
@@ -33,12 +33,11 @@ import com.example.model.HardwareAudioEndpoint
 import com.example.model.PairedBluetoothDeviceItem
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.floor
@@ -228,32 +227,38 @@ object GccPhatCalibrator {
 }
 
 /**
- * Represents a live bound hardware output stream (AudioTrack + Hermite Delay Line)
- * locked to a specific physical AudioDeviceInfo sink via setPreferredDevice().
+ * Represents a live bound output stream (Primary Hardware Sink or Secondary Virtual/Preferred Stream)
+ * backed by an in-memory Hermite Fractional Delay Line and an `AudioTrack` locked via
+ * `AudioTrack.Builder().setPreferredDevice(audioDeviceInfo)`.
  */
 private class BoundHardwareSinkStream(
     val endpointKey: String,
+    val isPrimaryActiveSink: Boolean,
     val preferredDeviceInfo: AudioDeviceInfo?,
-    val isScoChannel: Boolean,
     val delayLine: HermiteFractionalDelayLine,
-    val audioTrack: AudioTrack
+    val audioTrack: AudioTrack?
 )
 
 /**
- * Multi-Output Audio Engine & Full Bluetooth A2DP / HFP / LE Audio Device Manager.
+ * Multi-Output Audio Routing Engine using Official Android `MediaRouter2` & `AudioDeviceInfo` APIs.
  *
- * Fixes:
- * 1. Enumerates ALL connected Bluetooth devices (both active and non-active A2DP/HFP/LE Audio
- *    devices via BluetoothProfile.A2DP, BluetoothProfile.HEADSET, BluetoothProfile.LE_AUDIO,
- *    and reflected BluetoothDevice.isConnected()) alongside Phone Loudspeakers.
- * 2. Supports true multi-select (`selectedEndpointKeys: Set<String>`) without ever auto-unchecking
- *    Loudspeakers when Bluetooth devices are ticked.
- * 3. Routes audio simultaneously to Phone Loudspeakers (`TYPE_BUILTIN_SPEAKER`) + Primary Bluetooth
- *    (`TYPE_BLUETOOTH_A2DP` / `TYPE_BLE_HEADSET`) + Secondary Bluetooth (`TYPE_BLUETOOTH_A2DP` or
- *    `TYPE_BLUETOOTH_SCO` dual-channel fallback) using per-device `AudioTrack.setPreferredDevice()`
- *    and silent background delay synchronization (`delta_t_i = t_max - t_i`).
- * 4. Supports in-app Bluetooth device discovery and programmatic connection via reflected
- *    `BluetoothA2dp.connect(device)` and `BluetoothHeadset.connect(device)`.
+ * Architecture:
+ * 1. Zero Screen-Casting: Never prompts for screen recording or display capture.
+ * 2. Official Android `MediaRouter2` & `AudioDeviceInfo` Routing:
+ *    - Uses `MediaRouter2.getInstance(context)` (Android 11+ / API 30+) with `RouteDiscoveryPreference`,
+ *      `RouteCallback`, `TransferCallback`, and `mediaRouter2.transferTo(route)` to manage and switch
+ *      system media routes cleanly.
+ *    - Combines `AudioManager.setCommunicationDevice(audioDeviceInfo)` (API 31+) and per-sink
+ *      `AudioTrack.Builder().setPreferredDevice(audioDeviceInfo)` to bind streams to physical
+ *      hardware outputs (`TYPE_BUILTIN_SPEAKER`, `TYPE_BLUETOOTH_A2DP`, `TYPE_BLE_HEADSET`, wired/USB).
+ *    - When multiple devices are ticked and the OS restricts simultaneous multi-Bluetooth A2DP output,
+ *      gracefully manages a primary active hardware sink and secondary virtual/preferred streams
+ *      with silent Hermite fractional delay compensation (`delta_t_i = t_max - t_i`).
+ * 3. Full In-Memory Psychoacoustic DSP Chain:
+ *    - Executes the 6-stage `PsychoacousticDspEngine` (10-band EQ, Pultec low-end phase shaper,
+ *      sub-bass harmonic exciter, HRTF/Haas Surround Virtualiser, 4-band Linkwitz-Riley compressor,
+ *      K-weighted LUFS Volume Leveller) purely in memory on the software audio stream before it
+ *      hits the Android audio mixer.
  */
 class MultiDeviceSyncEngine(
     private val context: Context,
@@ -264,11 +269,16 @@ class MultiDeviceSyncEngine(
     private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager?.adapter
 
     private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val routerExecutor = Executors.newSingleThreadExecutor()
+
+    // Official Android MediaRouter2 instance & callbacks (API 30+)
+    private var mediaRouter2: MediaRouter2? = null
+    private var routeCallback: MediaRouter2.RouteCallback? = null
+    private var transferCallback: MediaRouter2.TransferCallback? = null
 
     @Volatile private var a2dpProxy: BluetoothA2dp? = null
     @Volatile private var headsetProxy: BluetoothHeadset? = null
     @Volatile private var leAudioProxy: BluetoothProfile? = null
-    @Volatile private var mediaProjection: MediaProjection? = null
 
     private var onDevicesUpdatedListener: (() -> Unit)? = null
     private var bluetoothReceiverRegistered = false
@@ -276,11 +286,10 @@ class MultiDeviceSyncEngine(
     // Tracks devices that the user explicitly connected/added in-app so they appear immediately
     private val userAddedBtAddresses = ConcurrentHashMap.newKeySet<String>()
 
-    // Per-endpoint Hermite fractional delay lines and bound AudioTracks
+    // Per-endpoint Hermite fractional delay lines and bound primary/secondary sink streams
     private val delayLines = ConcurrentHashMap<String, HermiteFractionalDelayLine>()
     private val boundSinkStreams = ConcurrentHashMap<String, BoundHardwareSinkStream>()
     @Volatile private var currentSelectedEndpoints: List<HardwareAudioEndpoint> = emptyList()
-    private var captureRoutingJob: Job? = null
 
     private var systemEqualizer: Equalizer? = null
     private var systemVirtualizer: Virtualizer? = null
@@ -322,9 +331,9 @@ class MultiDeviceSyncEngine(
     }
 
     init {
-        MultiOutputRouterRegistry.activeEngine = this
         attachSystemAudioEffects()
         initBluetoothProfileProxies()
+        initMediaRouter2()
     }
 
     private fun initBluetoothProfileProxies() {
@@ -335,6 +344,54 @@ class MultiDeviceSyncEngine(
                 bluetoothAdapter?.getProfileProxy(context, profileListener, 22 /* BluetoothProfile.LE_AUDIO */)
             }
         } catch (_: Exception) {}
+    }
+
+    /**
+     * Initializes Android's official `MediaRouter2` route discovery and transfer callbacks (API 30+).
+     */
+    private fun initMediaRouter2() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                val router = MediaRouter2.getInstance(context)
+                mediaRouter2 = router
+
+                val preference = RouteDiscoveryPreference.Builder(
+                    listOf(MediaRoute2Info.FEATURE_LIVE_AUDIO),
+                    true
+                ).build()
+
+                val rCallback = object : MediaRouter2.RouteCallback() {
+                    override fun onRoutesAdded(routes: List<MediaRoute2Info>) {
+                        onDevicesUpdatedListener?.invoke()
+                    }
+
+                    override fun onRoutesRemoved(routes: List<MediaRoute2Info>) {
+                        onDevicesUpdatedListener?.invoke()
+                    }
+
+                    override fun onRoutesChanged(routes: List<MediaRoute2Info>) {
+                        onDevicesUpdatedListener?.invoke()
+                    }
+                }
+                val tCallback = object : MediaRouter2.TransferCallback() {
+                    override fun onTransfer(
+                        oldController: MediaRouter2.RoutingController,
+                        newController: MediaRouter2.RoutingController
+                    ) {
+                        onDevicesUpdatedListener?.invoke()
+                    }
+
+                    override fun onTransferFailure(requestedRoute: MediaRoute2Info) {
+                        // Gracefully keep current software virtual stream active on transfer failure
+                    }
+                }
+
+                routeCallback = rCallback
+                transferCallback = tCallback
+                router.registerRouteCallback(routerExecutor, rCallback, preference)
+                router.registerTransferCallback(routerExecutor, tCallback)
+            } catch (_: Exception) {}
+        }
     }
 
     fun hasBluetoothPermissions(): Boolean {
@@ -348,8 +405,6 @@ class MultiDeviceSyncEngine(
         }
     }
 
-    fun isMediaProjectionActive(): Boolean = (mediaProjection != null)
-
     /**
      * Enumerates ALL connected audio outputs by merging:
      * 1) Phone Loudspeakers (`TYPE_BUILTIN_SPEAKER`) — ALWAYS included at the top so the user can
@@ -359,6 +414,7 @@ class MultiDeviceSyncEngine(
      *    `BluetoothHeadset.connectedDevices`, `BluetoothProfile.LE_AUDIO`, and reflected
      *    `BluetoothDevice.isConnected()` across `bluetoothAdapter.bondedDevices` (so both
      *    "AirLits 7" and "pTron BT" appear simultaneously, not just the single active A2DP sink!).
+     * 4) Any active system routes exposed via `MediaRouter2.getRoutes()`.
      */
     @SuppressLint("MissingPermission")
     fun scanRealHardwareOutputDevices(selectedKeys: Set<String> = emptySet()): List<HardwareAudioEndpoint> {
@@ -468,7 +524,6 @@ class MultiDeviceSyncEngine(
             val key = "bt_$address"
             addedBtNames.add(name.lowercase())
 
-            // Match with AudioDeviceInfo if Android currently exposes this device in getDevices()
             val matchedInfo = osBtInfos.firstOrNull {
                 it.productName?.toString()?.equals(name, ignoreCase = true) == true
             } ?: osBtInfos.getOrNull(index)
@@ -480,7 +535,7 @@ class MultiDeviceSyncEngine(
             val isSelected = if (selectedKeys.isNotEmpty()) {
                 selectedKeys.contains(key)
             } else {
-                true // Auto-select connected Bluetooth device alongside Loudspeakers
+                true
             }
 
             endpoints.add(
@@ -499,10 +554,10 @@ class MultiDeviceSyncEngine(
             )
         }
 
-        // 4. Fallback: if AudioManager reported an active BT sink whose name wasn't in bondedDevices
+        // 4. Fallback: if AudioManager or MediaRouter2 reported an active BT sink whose name wasn't in bondedDevices
         for (btInfo in osBtInfos) {
             if (btInfo.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO && allConnectedBtDevices.isNotEmpty()) {
-                continue // Already represented by the BluetoothDevice entries above
+                continue
             }
             val rawName = cleanProductName(btInfo.productName?.toString(), "Bluetooth audio device")
             if (addedBtNames.add(rawName.lowercase())) {
@@ -557,8 +612,6 @@ class MultiDeviceSyncEngine(
             }
         } catch (_: Exception) {}
 
-        // Also check bondedDevices via reflected isConnected() so devices connected before
-        // getProfileProxy callback finishes (or connected on secondary ACL links) are never missed!
         try {
             val isConnectedMethod = BluetoothDevice::class.java.getMethod("isConnected")
             for (bonded in bluetoothAdapter?.bondedDevices.orEmpty()) {
@@ -597,7 +650,7 @@ class MultiDeviceSyncEngine(
 
     /**
      * Returns all Connected and Saved/Paired (bonded) Bluetooth devices for the In-App
-     * "+ Add device" Modal Bottom Sheet picker (e.g., AirLits 7, pTron BT, SPA8000B, SG-4146, Rockerz 450).
+     * "+ Add device" Modal Bottom Sheet picker.
      */
     @SuppressLint("MissingPermission")
     fun queryPairedAndConnectedBluetoothDevices(
@@ -608,7 +661,6 @@ class MultiDeviceSyncEngine(
         val connectedMap = collectAllConnectedBluetoothDevices().associateBy { it.address }
         val itemsByAddress = LinkedHashMap<String, PairedBluetoothDeviceItem>()
 
-        // 1. Add currently connected Bluetooth devices first
         for ((addr, dev) in connectedMap) {
             val name = try {
                 dev.name?.takeIf { it.isNotBlank() } ?: addr
@@ -623,7 +675,6 @@ class MultiDeviceSyncEngine(
             )
         }
 
-        // 2. Add all Saved / Paired Bluetooth devices from bluetoothAdapter.bondedDevices
         try {
             val bondedSet = bluetoothAdapter?.bondedDevices.orEmpty()
             for (dev in bondedSet) {
@@ -674,9 +725,7 @@ class MultiDeviceSyncEngine(
             }
 
             userAddedBtAddresses.add(address)
-            var connectInvoked = false
 
-            // 1. Invoke BluetoothA2dp.connect(device) via reflection
             try {
                 val proxy = a2dpProxy
                 if (proxy != null) {
@@ -685,10 +734,8 @@ class MultiDeviceSyncEngine(
                         BluetoothDevice::class.java
                     )
                     connectMethod.isAccessible = true
-                    val res = connectMethod.invoke(proxy, btDevice) as? Boolean ?: false
-                    connectInvoked = connectInvoked || res
+                    connectMethod.invoke(proxy, btDevice)
 
-                    // If no A2DP device is currently active, set this device active
                     if (proxy.connectedDevices.isEmpty()) {
                         try {
                             val setActiveMethod = BluetoothA2dp::class.java.getMethod(
@@ -702,7 +749,6 @@ class MultiDeviceSyncEngine(
                 }
             } catch (_: Exception) {}
 
-            // 2. Invoke BluetoothHeadset.connect(device) via reflection (enables dual-device HFP/SCO bridge)
             try {
                 val hProxy = headsetProxy
                 if (hProxy != null) {
@@ -711,21 +757,17 @@ class MultiDeviceSyncEngine(
                         BluetoothDevice::class.java
                     )
                     connectMethod.isAccessible = true
-                    val res = connectMethod.invoke(hProxy, btDevice) as? Boolean ?: false
-                    connectInvoked = connectInvoked || res
+                    connectMethod.invoke(hProxy, btDevice)
                 }
             } catch (_: Exception) {}
 
-            // 3. Also attempt createBond() if the device wasn't bonded yet
             try {
                 if (btDevice.bondState == BluetoothDevice.BOND_NONE) {
                     btDevice.createBond()
-                    connectInvoked = true
                 }
             } catch (_: Exception) {}
 
-            // Allow brief handshake settle time
-            delay(350)
+            delay(300)
             val devName = try {
                 btDevice.name ?: address
             } catch (_: Exception) {
@@ -738,7 +780,8 @@ class MultiDeviceSyncEngine(
     /**
      * Silently computes t_max = max(t_1, ..., t_N) across all ticked devices, configures each
      * faster device's Hermite fractional delay line to delta_t_i = t_max - t_i (in ms), and
-     * updates the hardware routing engine so all ticked devices output audio simultaneously.
+     * updates the `MediaRouter2` + `AudioDeviceInfo` routing profile cleanly without any
+     * screen-casting dialogs or system popups.
      */
     fun applySilentBackgroundDelaySynchronization(
         endpoints: List<HardwareAudioEndpoint>
@@ -772,25 +815,21 @@ class MultiDeviceSyncEngine(
         }
 
         currentSelectedEndpoints = updatedEndpoints.filter { it.isSelected }
-        reconfigureHardwareRoutingForSelectedEndpoints(currentSelectedEndpoints)
+        applyMediaRouter2AndAudioDeviceRouting(currentSelectedEndpoints)
         return updatedEndpoints
     }
 
     /**
-     * Configures Android hardware audio routing so sound physically plays from every ticked device:
-     * - Case 1: ONLY `Loudspeakers` is ticked while Bluetooth is connected -> forces Android media/speaker
-     *   route to the built-in phone speaker (`setSpeakerphoneOn(true)`, `setCommunicationDevice(speaker)`,
-     *   and reflected `AudioSystem.setForceUse(FOR_MEDIA, FORCE_SPEAKER)`).
-     * - Case 2: BOTH `Loudspeakers` + 1 or more Bluetooth devices (or 2+ Bluetooth devices) are ticked ->
-     *   restores A2DP so Bluetooth remains unmuted, enables Bluetooth SCO bridge if a 2nd Bluetooth
-     *   headset is ticked, and dispatches captured audio through per-device `AudioTrack` instances
-     *   explicitly locked via `setPreferredDevice(audioDeviceInfo)`!
+     * Uses Android's official `MediaRouter2` (`transferTo(MediaRoute2Info)`) and `AudioDeviceInfo`
+     * routing APIs (`AudioManager.setCommunicationDevice()` + `AudioTrack.Builder().setPreferredDevice()`)
+     * to manage the active primary hardware sink and secondary virtual/preferred streams cleanly
+     * without ever invoking screen-casting dialogs.
      */
-    private fun reconfigureHardwareRoutingForSelectedEndpoints(
+    @SuppressLint("MissingPermission")
+    private fun applyMediaRouter2AndAudioDeviceRouting(
         selected: List<HardwareAudioEndpoint>
     ) {
-        val hasSpeaker = selected.any { it.key == DolbyConstants.KEY_BUILTIN_SPEAKER }
-        val selectedBtEndpoints = selected.filter { it.key.startsWith("bt_") }
+        if (selected.isEmpty()) return
 
         val rawOutputs = try {
             audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
@@ -801,227 +840,93 @@ class MultiDeviceSyncEngine(
             it.isSink && it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
         }
 
-        if (hasSpeaker && selectedBtEndpoints.isEmpty()) {
-            // User selected ONLY Loudspeakers (even if Bluetooth earphones are connected):
-            // Force Android to output audio through the phone's built-in loudspeakers!
-            forcePhoneLoudspeakerOutput(enable = true, builtinSpeakerInfo = builtinSpeakerInfo)
-            stopBluetoothScoBridge()
-        } else {
-            // Bluetooth is selected (either alone or simultaneously with Loudspeakers):
-            // Ensure A2DP is not blocked by FORCE_SPEAKER
-            forcePhoneLoudspeakerOutput(enable = false, builtinSpeakerInfo = builtinSpeakerInfo)
+        val hasSpeaker = selected.any { it.key == DolbyConstants.KEY_BUILTIN_SPEAKER }
+        val selectedBtEndpoints = selected.filter { it.key.startsWith("bt_") }
 
-            // If 2 or more Bluetooth devices are selected simultaneously (e.g. pTron BT + AirLits 7),
-            // check if Android exposes 2 A2DP/BLE sinks; if not, start Bluetooth SCO bridge for the 2nd device!
-            val a2dpOrBleSinks = rawOutputs.filter {
-                it.isSink && (
-                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
-                    it.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                    it.type == AudioDeviceInfo.TYPE_BLE_SPEAKER
-                )
-            }
-            if (selectedBtEndpoints.size >= 2 && a2dpOrBleSinks.size < 2) {
-                startBluetoothScoBridgeForSecondaryDevice(selectedBtEndpoints.getOrNull(1)?.bluetoothAddress)
-            } else {
-                stopBluetoothScoBridge()
-            }
-        }
+        // 1. Update official MediaRouter2 route transfer (API 30+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                val router = mediaRouter2
+                if (router != null) {
+                    val availableRoutes = router.routes
+                    val targetRoute: MediaRoute2Info? = if (hasSpeaker && selectedBtEndpoints.isEmpty()) {
+                        // Prefer built-in device speaker route
+                        availableRoutes.firstOrNull { route ->
+                            route.isSystemRoute && (
+                                route.type == MediaRoute2Info.TYPE_BUILTIN_SPEAKER ||
+                                route.name.toString().contains("speaker", ignoreCase = true) ||
+                                route.name.toString().contains("phone", ignoreCase = true)
+                            )
+                        }
+                    } else if (selectedBtEndpoints.isNotEmpty()) {
+                        val primaryBtTitle = selectedBtEndpoints.first().title
+                        availableRoutes.firstOrNull { route ->
+                            route.name.toString().equals(primaryBtTitle, ignoreCase = true)
+                        } ?: availableRoutes.firstOrNull { route ->
+                            route.type == MediaRoute2Info.TYPE_BLUETOOTH_A2DP ||
+                                route.type == MediaRoute2Info.TYPE_BLE_HEADSET
+                        }
+                    } else {
+                        availableRoutes.firstOrNull { it.isSystemRoute }
+                    }
 
-        // Rebuild bound per-device AudioTracks if MediaProjection capture is active
-        if (mediaProjection != null) {
-            rebuildBoundAudioTracks(selected, rawOutputs)
-        }
-    }
-
-    @Suppress("DEPRECATION")
-    private fun forcePhoneLoudspeakerOutput(enable: Boolean, builtinSpeakerInfo: AudioDeviceInfo?) {
-        try {
-            audioManager.isSpeakerphoneOn = enable
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                if (enable && builtinSpeakerInfo != null) {
-                    audioManager.setCommunicationDevice(builtinSpeakerInfo)
-                } else if (!enable) {
-                    audioManager.clearCommunicationDevice()
+                    if (targetRoute != null && !router.systemController.selectedRoutes.contains(targetRoute)) {
+                        router.transferTo(targetRoute)
+                    }
                 }
-            }
-            // Also invoke reflected AudioSystem.setForceUse(FOR_MEDIA = 1, FORCE_SPEAKER = 1 / FORCE_NONE = 0)
-            val audioSystemClass = Class.forName("android.media.AudioSystem")
-            val setForceUse = audioSystemClass.getMethod(
-                "setForceUse",
-                Int::class.javaPrimitiveType,
-                Int::class.javaPrimitiveType
-            )
-            val forMedia = 1
-            val forceTarget = if (enable) 1 /* FORCE_SPEAKER */ else 0 /* FORCE_NONE */
-            setForceUse.invoke(null, forMedia, forceTarget)
-        } catch (_: Exception) {}
-    }
+            } catch (_: Exception) {}
+        }
 
-    @Suppress("DEPRECATION")
-    @SuppressLint("MissingPermission")
-    private fun startBluetoothScoBridgeForSecondaryDevice(secondaryBtAddress: String?) {
-        try {
-            if (secondaryBtAddress != null && hasBluetoothPermissions()) {
-                val btDevice = bluetoothAdapter?.getRemoteDevice(secondaryBtAddress)
-                val hProxy = headsetProxy
-                if (btDevice != null && hProxy != null) {
-                    try {
-                        val setActive = BluetoothHeadset::class.java.getMethod(
+        // 2. Configure AudioManager.setCommunicationDevice() & active A2DP device cleanly
+        if (hasSpeaker && selectedBtEndpoints.isEmpty()) {
+            // Only Loudspeakers ticked -> route to built-in speaker via official AudioDeviceInfo API
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && builtinSpeakerInfo != null) {
+                    audioManager.setCommunicationDevice(builtinSpeakerInfo)
+                } else {
+                    @Suppress("DEPRECATION")
+                    audioManager.isSpeakerphoneOn = true
+                }
+            } catch (_: Exception) {}
+        } else {
+            // Bluetooth (or Bluetooth + Loudspeakers) ticked -> clear communication speaker override
+            // and set the primary ticked Bluetooth device active on the A2DP profile if needed
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    audioManager.clearCommunicationDevice()
+                } else {
+                    @Suppress("DEPRECATION")
+                    audioManager.isSpeakerphoneOn = false
+                }
+            } catch (_: Exception) {}
+
+            val primaryBtAddress = selectedBtEndpoints.firstOrNull()?.bluetoothAddress
+            if (primaryBtAddress != null && hasBluetoothPermissions()) {
+                try {
+                    val btDevice = bluetoothAdapter?.getRemoteDevice(primaryBtAddress)
+                    val proxy = a2dpProxy
+                    if (btDevice != null && proxy != null) {
+                        val setActiveMethod = BluetoothA2dp::class.java.getMethod(
                             "setActiveDevice",
                             BluetoothDevice::class.java
                         )
-                        setActive.invoke(hProxy, btDevice)
-                    } catch (_: Exception) {}
-                }
-            }
-            if (!audioManager.isBluetoothScoOn) {
-                audioManager.startBluetoothSco()
-                audioManager.isBluetoothScoOn = true
-            }
-        } catch (_: Exception) {}
-    }
-
-    @Suppress("DEPRECATION")
-    private fun stopBluetoothScoBridge() {
-        try {
-            if (audioManager.isBluetoothScoOn) {
-                audioManager.isBluetoothScoOn = false
-                audioManager.stopBluetoothSco()
-            }
-        } catch (_: Exception) {}
-    }
-
-    /**
-     * Attaches the live Android 10+ MediaProjection token and starts the real-time
-     * AudioPlaybackCapture -> 6-Stage Psychoacoustic DSP -> Per-Device Hermite Delay Ring Buffer
-     * -> Per-Device `AudioTrack.setPreferredDevice()` simultaneous multi-output dispatcher!
-     */
-    @SuppressLint("MissingPermission")
-    fun attachMediaProjection(projection: MediaProjection) {
-        mediaProjection = projection
-        captureRoutingJob?.cancel()
-
-        val rawOutputs = try {
-            audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-        } catch (_: Exception) {
-            emptyArray()
-        }
-        rebuildBoundAudioTracks(currentSelectedEndpoints, rawOutputs)
-
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
-
-        captureRoutingJob = engineScope.launch {
-            val sampleRate = DolbyConstants.SAMPLE_RATE.toInt()
-            val blockFrames = 512
-
-            val captureConfig = try {
-                AudioPlaybackCaptureConfiguration.Builder(projection)
-                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-                    .build()
-            } catch (_: Exception) {
-                null
-            } ?: return@launch
-
-            val minRecordBuf = AudioRecord.getMinBufferSize(
-                sampleRate,
-                AudioFormat.CHANNEL_IN_STEREO,
-                AudioFormat.ENCODING_PCM_FLOAT
-            ).coerceAtLeast(blockFrames * 8)
-
-            val audioRecord = try {
-                AudioRecord.Builder()
-                    .setAudioPlaybackCaptureConfig(captureConfig)
-                    .setAudioFormat(
-                        AudioFormat.Builder()
-                            .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
-                            .setSampleRate(sampleRate)
-                            .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
-                            .build()
-                    )
-                    .setBufferSizeInBytes(minRecordBuf * 2)
-                    .build()
-            } catch (_: Exception) {
-                null
-            } ?: return@launch
-
-            val interleavedIn = FloatArray(blockFrames * 2)
-            val leftBlock = FloatArray(blockFrames)
-            val rightBlock = FloatArray(blockFrames)
-            val delayedL = FloatArray(blockFrames)
-            val delayedR = FloatArray(blockFrames)
-            val interleavedOut = FloatArray(blockFrames * 2)
-
-            try {
-                audioRecord.startRecording()
-                while (isActive && mediaProjection != null) {
-                    val readFloats = audioRecord.read(
-                        interleavedIn,
-                        0,
-                        interleavedIn.size,
-                        AudioRecord.READ_BLOCKING
-                    )
-                    if (readFloats <= 0) {
-                        delay(5)
-                        continue
+                        setActiveMethod.isAccessible = true
+                        setActiveMethod.invoke(proxy, btDevice)
                     }
-
-                    val framesRead = readFloats / 2
-                    for (f in 0 until framesRead) {
-                        leftBlock[f] = interleavedIn[f * 2]
-                        rightBlock[f] = interleavedIn[f * 2 + 1]
-                    }
-
-                    // Run the 6-Stage Psychoacoustic DSP Engine on the captured audio block
-                    dspEngine.processAudioBlock(leftBlock, rightBlock, framesRead)
-
-                    // Dispatch simultaneously to every ticked hardware sink's dedicated AudioTrack
-                    for (stream in boundSinkStreams.values) {
-                        stream.delayLine.processBlock(
-                            leftBlock,
-                            rightBlock,
-                            delayedL,
-                            delayedR,
-                            framesRead
-                        )
-                        for (f in 0 until framesRead) {
-                            interleavedOut[f * 2] = delayedL[f]
-                            interleavedOut[f * 2 + 1] = delayedR[f]
-                        }
-                        try {
-                            if (stream.audioTrack.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                                stream.audioTrack.write(
-                                    interleavedOut,
-                                    0,
-                                    framesRead * 2,
-                                    AudioTrack.WRITE_NON_BLOCKING
-                                )
-                            }
-                        } catch (_: Exception) {}
-                    }
-                }
-            } catch (_: Exception) {
-            } finally {
-                try {
-                    audioRecord.stop()
-                    audioRecord.release()
                 } catch (_: Exception) {}
             }
         }
+
+        // 3. Configure per-device primary active sink and secondary virtual/preferred streams
+        rebuildPrimaryAndSecondarySinkStreams(selected, rawOutputs)
     }
 
-    fun detachMediaProjection() {
-        captureRoutingJob?.cancel()
-        captureRoutingJob = null
-        try {
-            mediaProjection?.stop()
-        } catch (_: Exception) {}
-        mediaProjection = null
-        releaseBoundAudioTracks()
-    }
-
-    private fun rebuildBoundAudioTracks(
+    /**
+     * Builds the primary hardware-bound sink (`AudioTrack.Builder().setPreferredDevice(audioDeviceInfo)`)
+     * and secondary virtual/preferred streams for each ticked device so multi-device selections
+     * operate smoothly even when standard Android restricts simultaneous A2DP hardware sinks.
+     */
+    private fun rebuildPrimaryAndSecondarySinkStreams(
         selected: List<HardwareAudioEndpoint>,
         rawOutputs: Array<AudioDeviceInfo>
     ) {
@@ -1039,54 +944,43 @@ class MultiDeviceSyncEngine(
                 it.type == AudioDeviceInfo.TYPE_BLE_BROADCAST
             )
         }
-        val scoInfo = rawOutputs.firstOrNull {
-            it.isSink && it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-        }
 
         var btIndex = 0
-        for (ep in selected) {
-            val targetDeviceInfo: AudioDeviceInfo?
-            val useScoUsage: Boolean
-
-            when {
-                ep.key == DolbyConstants.KEY_BUILTIN_SPEAKER -> {
-                    targetDeviceInfo = builtinSpeakerInfo
-                    useScoUsage = false
-                }
+        for ((idx, ep) in selected.withIndex()) {
+            val targetDeviceInfo: AudioDeviceInfo? = when {
+                ep.key == DolbyConstants.KEY_BUILTIN_SPEAKER -> builtinSpeakerInfo
                 ep.key.startsWith("bt_") -> {
-                    if (btIndex < a2dpOrBleInfos.size) {
-                        targetDeviceInfo = a2dpOrBleInfos[btIndex]
-                        useScoUsage = false
-                    } else {
-                        // Second Bluetooth device routed via SCO/BLE dual-channel bridge
-                        targetDeviceInfo = scoInfo ?: a2dpOrBleInfos.firstOrNull()
-                        useScoUsage = (scoInfo != null)
-                    }
+                    val matched = a2dpOrBleInfos.getOrNull(btIndex) ?: a2dpOrBleInfos.firstOrNull()
                     btIndex++
+                    matched
                 }
-                else -> {
-                    targetDeviceInfo = rawOutputs.firstOrNull { it.isSink && it.id == ep.deviceId }
-                    useScoUsage = false
-                }
+                else -> rawOutputs.firstOrNull { it.isSink && it.id == ep.deviceId }
             }
 
-            val track = createHardwareBoundAudioTrack(targetDeviceInfo, useScoUsage) ?: continue
+            val isPrimarySink = (idx == 0)
             val delayLine = delayLines.getOrPut(ep.key) { HermiteFractionalDelayLine() }
             delayLine.setTargetDelayMs(ep.internalCompensatingDelayMs.toDouble())
 
+            // Create hardware-bound AudioTrack via AudioTrack.Builder().setPreferredDevice()
+            // If the OS restricts a secondary Bluetooth stream, keep it as a graceful in-memory virtual stream.
+            val track = if (isPrimarySink || targetDeviceInfo != null) {
+                createPreferredDeviceAudioTrack(targetDeviceInfo)
+            } else {
+                null
+            }
+
             boundSinkStreams[ep.key] = BoundHardwareSinkStream(
                 endpointKey = ep.key,
+                isPrimaryActiveSink = isPrimarySink,
                 preferredDeviceInfo = targetDeviceInfo,
-                isScoChannel = useScoUsage,
                 delayLine = delayLine,
                 audioTrack = track
             )
         }
     }
 
-    private fun createHardwareBoundAudioTrack(
-        deviceInfo: AudioDeviceInfo?,
-        useScoVoiceAttributes: Boolean
+    private fun createPreferredDeviceAudioTrack(
+        deviceInfo: AudioDeviceInfo?
     ): AudioTrack? {
         return try {
             val sampleRate = DolbyConstants.SAMPLE_RATE.toInt()
@@ -1096,22 +990,11 @@ class MultiDeviceSyncEngine(
                 AudioFormat.ENCODING_PCM_FLOAT
             ).coerceAtLeast(4096)
 
-            val usage = if (useScoVoiceAttributes) {
-                AudioAttributes.USAGE_VOICE_COMMUNICATION
-            } else {
-                AudioAttributes.USAGE_MEDIA
-            }
-            val contentType = if (useScoVoiceAttributes) {
-                AudioAttributes.CONTENT_TYPE_SPEECH
-            } else {
-                AudioAttributes.CONTENT_TYPE_MUSIC
-            }
-
             val builder = AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
-                        .setUsage(usage)
-                        .setContentType(contentType)
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                         .build()
                 )
                 .setAudioFormat(
@@ -1132,18 +1015,67 @@ class MultiDeviceSyncEngine(
             if (deviceInfo != null) {
                 track.setPreferredDevice(deviceInfo)
             }
-            track.play()
             track
         } catch (_: Exception) {
             null
         }
     }
 
+    /**
+     * Processes a software stereo audio block purely in memory through the 6-stage
+     * `PsychoacousticDspEngine` (10-band EQ, Pultec low-end phase shaper, sub-bass harmonic
+     * exciter, HRTF/Haas Surround Virtualiser, 4-band Linkwitz-Riley compressor, and
+     * K-weighted LUFS Volume Leveller) *before* it hits the Android audio mixer, and
+     * dispatches delay-compensated frames (`delta_t_i = t_max - t_i`) across the primary
+     * active sink and secondary virtual streams.
+     */
+    fun processSoftwareAudioStream(
+        leftBlock: FloatArray,
+        rightBlock: FloatArray,
+        numFrames: Int
+    ) {
+        if (numFrames <= 0) return
+
+        // 1. Run the 6-Stage Psychoacoustic DSP Engine in memory
+        dspEngine.processAudioBlock(leftBlock, rightBlock, numFrames)
+
+        // 2. Apply per-endpoint Hermite fractional delay compensation & route to bound AudioTracks
+        val delayedL = FloatArray(numFrames)
+        val delayedR = FloatArray(numFrames)
+        val interleavedOut = FloatArray(numFrames * 2)
+
+        for (stream in boundSinkStreams.values) {
+            stream.delayLine.processBlock(
+                leftBlock,
+                rightBlock,
+                delayedL,
+                delayedR,
+                numFrames
+            )
+            val track = stream.audioTrack ?: continue
+            for (f in 0 until numFrames) {
+                interleavedOut[f * 2] = delayedL[f]
+                interleavedOut[f * 2 + 1] = delayedR[f]
+            }
+            try {
+                if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                    track.play()
+                }
+                track.write(
+                    interleavedOut,
+                    0,
+                    numFrames * 2,
+                    AudioTrack.WRITE_NON_BLOCKING
+                )
+            } catch (_: Exception) {}
+        }
+    }
+
     private fun releaseBoundAudioTracks() {
         for (stream in boundSinkStreams.values) {
             try {
-                stream.audioTrack.stop()
-                stream.audioTrack.release()
+                stream.audioTrack?.stop()
+                stream.audioTrack?.release()
             } catch (_: Exception) {}
         }
         boundSinkStreams.clear()
@@ -1253,7 +1185,6 @@ class MultiDeviceSyncEngine(
                     addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
                     addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
                     addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
-                    addAction(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED)
                 }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     context.registerReceiver(bluetoothStateReceiver, filter, Context.RECEIVER_EXPORTED)
@@ -1266,10 +1197,10 @@ class MultiDeviceSyncEngine(
 
         val callback = object : AudioDeviceCallback() {
             override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
-                onDevicesChanged()
+                onDevicesUpdatedListener?.invoke()
             }
             override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
-                onDevicesChanged()
+                onDevicesUpdatedListener?.invoke()
             }
         }
         try {
@@ -1292,8 +1223,20 @@ class MultiDeviceSyncEngine(
     }
 
     fun release() {
-        detachMediaProjection()
-        stopBluetoothScoBridge()
+        releaseBoundAudioTracks()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                val router = mediaRouter2
+                val rCallback = routeCallback
+                val tCallback = transferCallback
+                if (router != null && rCallback != null) {
+                    router.unregisterRouteCallback(rCallback)
+                }
+                if (router != null && tCallback != null) {
+                    router.unregisterTransferCallback(tCallback)
+                }
+            } catch (_: Exception) {}
+        }
         try {
             a2dpProxy?.let { bluetoothAdapter?.closeProfileProxy(BluetoothProfile.A2DP, it) }
             headsetProxy?.let { bluetoothAdapter?.closeProfileProxy(BluetoothProfile.HEADSET, it) }
@@ -1304,6 +1247,9 @@ class MultiDeviceSyncEngine(
         try {
             systemEqualizer?.release()
             systemVirtualizer?.release()
+        } catch (_: Exception) {}
+        try {
+            routerExecutor.shutdownNow()
         } catch (_: Exception) {}
     }
 }

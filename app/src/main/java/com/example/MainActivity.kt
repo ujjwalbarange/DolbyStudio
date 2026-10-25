@@ -152,13 +152,11 @@ fun DolbyAtmosApp(
                                 showAddDeviceSheet = uiState.showAddDeviceSheet,
                                 pairedBluetoothDevices = uiState.pairedBluetoothDevices,
                                 connectingBluetoothAddress = uiState.connectingBluetoothAddress,
-                                isMultiOutputCaptureActive = uiState.isMultiOutputCaptureActive,
                                 onToggleEndpoint = { viewModel.toggleEndpointSelection(it) },
                                 onRescanHardwareEndpoints = { viewModel.refreshHardwareEndpoints() },
                                 onOpenAddDeviceSheet = { viewModel.openAddDeviceSheet() },
                                 onDismissAddDeviceSheet = { viewModel.dismissAddDeviceSheet() },
                                 onConnectBluetoothDevice = { viewModel.connectAndSelectBluetoothDeviceFromSheet(it) },
-                                onMediaProjectionStateChanged = { viewModel.onMediaProjectionStateChanged() },
                                 onSelectMode = { viewModel.selectAudioMode(it) },
                                 onEditModeClick = { viewModel.openModeEditor(it) },
                                 onBackClick = { viewModel.navigateBack() }

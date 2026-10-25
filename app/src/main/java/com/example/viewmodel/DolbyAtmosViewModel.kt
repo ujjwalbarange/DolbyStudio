@@ -29,7 +29,6 @@ data class DolbyUiState(
     val showAddDeviceSheet: Boolean = false,
     val pairedBluetoothDevices: List<PairedBluetoothDeviceItem> = emptyList(),
     val connectingBluetoothAddress: String? = null,
-    val isMultiOutputCaptureActive: Boolean = false,
     val effectiveIeqBandsDb: List<Float> = List(10) { 0f }
 ) {
     val activeProfile: ModeProfileSettings
@@ -93,8 +92,6 @@ class DolbyAtmosViewModel(application: Application) : AndroidViewModel(applicati
     private val syncEngine = MultiDeviceSyncEngine(application.applicationContext, dspEngine)
     private var deviceCallback: AudioDeviceCallback? = null
 
-    // Tracks keys we have already seen so newly connected BT devices default to ticked ON
-    // without ever auto-unchecking Loudspeakers or overriding user manual deselections.
     private val seenEndpointKeys = mutableSetOf<String>()
 
     private val _uiState: MutableStateFlow<DolbyUiState>
@@ -109,15 +106,13 @@ class DolbyAtmosViewModel(application: Application) : AndroidViewModel(applicati
         _uiState = MutableStateFlow(
             DolbyUiState(
                 hardwareEndpoints = initialEndpoints,
-                selectedEndpointKeys = initialSelectedKeys,
-                isMultiOutputCaptureActive = syncEngine.isMediaProjectionActive()
+                selectedEndpointKeys = initialSelectedKeys
             )
         )
         uiState = _uiState.asStateFlow()
 
         syncDspParametersWithState(_uiState.value)
 
-        // Register real-time hardware connection / disconnection + Bluetooth profile listener
         deviceCallback = syncEngine.registerDeviceCallback {
             refreshHardwareEndpoints()
         }
@@ -130,17 +125,15 @@ class DolbyAtmosViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     /**
-     * Rescans both AudioManager outputs and BluetoothAdapter (A2DP + HEADSET + LE_AUDIO + bondedDevices)
-     * so all connected Bluetooth devices (e.g., "AirLits 7" and "pTron BT") and "Loudspeakers"
-     * appear simultaneously.
+     * Rescans AudioManager outputs, MediaRouter2 routes, and BluetoothAdapter profiles
+     * (A2DP + HEADSET + LE_AUDIO + bondedDevices) so all connected Bluetooth devices
+     * and Loudspeakers appear simultaneously.
      */
     fun refreshHardwareEndpoints() {
         _uiState.update { state ->
             val rawScanned = syncEngine.scanRealHardwareOutputDevices(state.selectedEndpointKeys)
             val updatedSelectedKeys = state.selectedEndpointKeys.toMutableSet()
 
-            // Any newly discovered connected Bluetooth or wired device defaults to selected=true
-            // while preserving existing selections (never auto-unchecking Loudspeakers).
             for (ep in rawScanned) {
                 if (seenEndpointKeys.add(ep.key)) {
                     updatedSelectedKeys.add(ep.key)
@@ -164,8 +157,7 @@ class DolbyAtmosViewModel(application: Application) : AndroidViewModel(applicati
             val next = state.copy(
                 hardwareEndpoints = synced,
                 selectedEndpointKeys = updatedSelectedKeys,
-                pairedBluetoothDevices = pairedList,
-                isMultiOutputCaptureActive = syncEngine.isMediaProjectionActive()
+                pairedBluetoothDevices = pairedList
             )
             syncDspParametersWithState(next)
             next
@@ -173,8 +165,8 @@ class DolbyAtmosViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     /**
-     * True Multi-Select toggle: allows ticking 1, 2, 3, or more output devices simultaneously
-     * (e.g., Loudspeakers + pTron BT + AirLits 7). Ticking a Bluetooth device never unchecks Loudspeakers.
+     * True Multi-Select toggle: smoothly updates the active routing profile via MediaRouter2
+     * and AudioDeviceInfo without any system casting dialogs or popups.
      */
     fun toggleEndpointSelection(endpointKey: String) {
         _uiState.update { state ->
@@ -185,7 +177,6 @@ class DolbyAtmosViewModel(application: Application) : AndroidViewModel(applicati
                 updatedKeys.add(endpointKey)
             }
 
-            // Keep at least one output active so audio is never orphaned
             if (updatedKeys.isEmpty()) {
                 val fallbackKey = state.hardwareEndpoints.firstOrNull()?.key
                     ?: DolbyConstants.KEY_BUILTIN_SPEAKER
@@ -205,18 +196,13 @@ class DolbyAtmosViewModel(application: Application) : AndroidViewModel(applicati
             val next = state.copy(
                 hardwareEndpoints = synced,
                 selectedEndpointKeys = updatedKeys,
-                pairedBluetoothDevices = pairedList,
-                isMultiOutputCaptureActive = syncEngine.isMediaProjectionActive()
+                pairedBluetoothDevices = pairedList
             )
             syncDspParametersWithState(next)
             next
         }
     }
 
-    /**
-     * Opens the In-App "+ Add device" Modal Bottom Sheet listing all Connected and Saved/Paired
-     * Bluetooth devices directly inside the app without redirecting to Android Settings.
-     */
     fun openAddDeviceSheet() {
         _uiState.update { state ->
             val currentKeys = state.selectedEndpointKeys
@@ -238,11 +224,6 @@ class DolbyAtmosViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
-    /**
-     * Connects to a Paired/Saved or Connected Bluetooth device tapped inside the In-App
-     * "+ Add device" bottom sheet, adds it to the active output list under Loudspeakers,
-     * and ticks it ON (`isSelected = true`) automatically.
-     */
     fun connectAndSelectBluetoothDeviceFromSheet(address: String) {
         val targetKey = "bt_$address"
         _uiState.update { state ->
@@ -266,18 +247,11 @@ class DolbyAtmosViewModel(application: Application) : AndroidViewModel(applicati
                     hardwareEndpoints = synced,
                     selectedEndpointKeys = updatedKeys,
                     pairedBluetoothDevices = updatedPaired,
-                    connectingBluetoothAddress = null,
-                    isMultiOutputCaptureActive = syncEngine.isMediaProjectionActive()
+                    connectingBluetoothAddress = null
                 )
                 syncDspParametersWithState(next)
                 next
             }
-        }
-    }
-
-    fun onMediaProjectionStateChanged() {
-        _uiState.update { state ->
-            state.copy(isMultiOutputCaptureActive = syncEngine.isMediaProjectionActive())
         }
     }
 

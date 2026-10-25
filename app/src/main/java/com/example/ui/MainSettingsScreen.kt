@@ -1,11 +1,8 @@
 package com.example.ui
 
 import android.Manifest
-import android.app.Activity
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.provider.Settings
 import androidx.activity.compose.BackHandler
@@ -54,9 +51,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.example.R
-import com.example.dsp.MultiOutputPlaybackService
 import com.example.model.AudioMode
-import com.example.model.DolbyConstants
 import com.example.model.HardwareAudioEndpoint
 import com.example.model.PairedBluetoothDeviceItem
 import com.example.ui.components.DolbySelectionIndicator
@@ -78,13 +73,11 @@ fun MainSettingsScreen(
     showAddDeviceSheet: Boolean = false,
     pairedBluetoothDevices: List<PairedBluetoothDeviceItem> = emptyList(),
     connectingBluetoothAddress: String? = null,
-    isMultiOutputCaptureActive: Boolean = false,
     onToggleEndpoint: (String) -> Unit,
     onRescanHardwareEndpoints: () -> Unit,
     onOpenAddDeviceSheet: () -> Unit = {},
     onDismissAddDeviceSheet: () -> Unit = {},
     onConnectBluetoothDevice: (String) -> Unit = {},
-    onMediaProjectionStateChanged: () -> Unit = {},
     onSelectMode: (AudioMode) -> Unit,
     onEditModeClick: (AudioMode) -> Unit,
     onBackClick: () -> Unit,
@@ -93,33 +86,6 @@ fun MainSettingsScreen(
     BackHandler(onBack = onBackClick)
 
     val context = LocalContext.current
-
-    // MediaProjection launcher for simultaneous Phone Loudspeakers + Bluetooth audio capture & routing
-    val mediaProjectionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        if (result.resultCode == Activity.RESULT_OK && result.data != null) {
-            MultiOutputPlaybackService.startWithProjection(
-                context = context,
-                resultCode = result.resultCode,
-                resultData = result.data!!
-            )
-            onMediaProjectionStateChanged()
-        }
-    }
-
-    val requestMultiDeviceCaptureIfNeeded = {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && !isMultiOutputCaptureActive) {
-            try {
-                val projectionManager = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE)
-                    as? MediaProjectionManager
-                val captureIntent = projectionManager?.createScreenCaptureIntent()
-                if (captureIntent != null) {
-                    mediaProjectionLauncher.launch(captureIntent)
-                }
-            } catch (_: Exception) {}
-        }
-    }
 
     // Bluetooth permission launcher for Android 12+ (BLUETOOTH_CONNECT + BLUETOOTH_SCAN)
     val btPermissionsLauncher = rememberLauncherForActivityResult(
@@ -130,7 +96,6 @@ fun MainSettingsScreen(
     }
 
     // Clicking "+ Add device" opens the In-App Bluetooth Device Picker Bottom Sheet
-    // (never redirects directly to Android Settings!)
     val handleAddDeviceClick = {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val hasBtConnect = ContextCompat.checkSelfPermission(
@@ -156,23 +121,6 @@ fun MainSettingsScreen(
         } else {
             onRescanHardwareEndpoints()
             onOpenAddDeviceSheet()
-        }
-    }
-
-    val handleEndpointToggle: (HardwareAudioEndpoint) -> Unit = { endpoint ->
-        val willBeSelected = !endpoint.isSelected
-        val currentlySelectedCount = hardwareEndpoints.count { it.isSelected }
-        val newSelectedCount = if (willBeSelected) currentlySelectedCount + 1 else currentlySelectedCount - 1
-
-        onToggleEndpoint(endpoint.key)
-
-        // If user is ticking multiple output devices simultaneously (e.g. Loudspeakers + Bluetooth
-        // or 2+ Bluetooth devices), start simultaneous audio capture if not already active
-        val hasBtConnected = hardwareEndpoints.any { it.key.startsWith("bt_") }
-        val isCombiningSpeakerAndBt = hasBtConnected &&
-            (newSelectedCount >= 2 || (endpoint.key == DolbyConstants.KEY_BUILTIN_SPEAKER && willBeSelected))
-        if (newSelectedCount >= 2 && isCombiningSpeakerAndBt) {
-            requestMultiDeviceCaptureIfNeeded()
         }
     }
 
@@ -217,12 +165,12 @@ fun MainSettingsScreen(
                 )
             }
 
-            // Detected Real Hardware Output Devices (Multi-Select: Loudspeakers + All Connected BT Devices)
+            // Detected Real Hardware Output Devices (Clean multi-select via MediaRouter2 & AudioDeviceInfo)
             items(hardwareEndpoints.size) { idx ->
                 val endpoint = hardwareEndpoints[idx]
                 HardwareOutputRow(
                     endpoint = endpoint,
-                    onToggle = { handleEndpointToggle(endpoint) }
+                    onToggle = { onToggleEndpoint(endpoint.key) }
                 )
             }
 
@@ -311,7 +259,7 @@ fun MainSettingsScreen(
         }
     }
 
-    // In-App Device Picker Modal Bottom Sheet (Never forces user to leave app for paired BT devices)
+    // In-App Device Picker Modal Bottom Sheet
     if (showAddDeviceSheet) {
         val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         ModalBottomSheet(
@@ -327,10 +275,6 @@ fun MainSettingsScreen(
                 connectingAddress = connectingBluetoothAddress,
                 onSelectDevice = { item ->
                     onConnectBluetoothDevice(item.address)
-                    val selectedAfterConnect = hardwareEndpoints.count { it.isSelected } + 1
-                    if (selectedAfterConnect >= 2) {
-                        requestMultiDeviceCaptureIfNeeded()
-                    }
                 },
                 onPairBrandNewDevice = {
                     onDismissAddDeviceSheet()
@@ -366,7 +310,7 @@ private fun AddBluetoothDeviceBottomSheetContent(
         )
 
         Text(
-            text = "Tap any connected or saved Bluetooth device to add and enable simultaneous output",
+            text = "Tap any connected or saved Bluetooth device to add and enable audio routing",
             color = SubtitleSlateColor,
             fontSize = 14.sp,
             lineHeight = 20.sp,
@@ -424,7 +368,7 @@ private fun AddBluetoothDeviceBottomSheetContent(
                             Text(
                                 text = when {
                                     isConnecting -> "Connecting Bluetooth audio..."
-                                    item.isConnected && item.isSelectedInOutputList -> "Connected • Active in multi-output"
+                                    item.isConnected && item.isSelectedInOutputList -> "Connected • Active in output route"
                                     item.isConnected -> "Connected • Tap to tick in output list"
                                     else -> "Saved device • Tap to connect & tick"
                                 },

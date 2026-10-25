@@ -1,0 +1,55 @@
+name: Build Windows Desktop App (.exe)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Rust Stable Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Frontend Dependencies
+        run: npm install
+
+      - name: Build Desktop Application (.exe)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: 'Dolby Atmos PC v__VERSION__'
+          releaseBody: 'Automated Windows build output.'
+          releaseDraft: false
+          prerelease: false
+
+      - name: Locate and Collect Executables
+        id: collect_artifacts
+        shell: bash
+        run: |
+          mkdir -p output_exe
+          find src-tauri/target/release/bundle/ -type f \( -name "*.exe" -o -name "*.msi" \) -exec cp {} output_exe/ \; || true
+          find target/release/bundle/ -type f \( -name "*.exe" -o -name "*.msi" \) -exec cp {} output_exe/ \; || true
+          ls -la output_exe
+
+      - name: Upload Windows Executable Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dolby-Atmos-Windows-PC-x64
+          path: output_exe/*
+          if-no-files-found: error

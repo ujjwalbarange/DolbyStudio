@@ -887,7 +887,7 @@ mod win_wasapi {
                 };
 
                 if packet_frames == 0 {
-                    if let Some(h) = capture_evt {
+                    if let Some(h) = *capture_evt {
                         let _ = WaitForSingleObject(h, 4);
                     } else {
                         thread::sleep(Duration::from_millis(2));

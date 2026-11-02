@@ -22,6 +22,8 @@ import {
   Waves,
   BarChart3,
   Sparkles,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 
 type MobileScreen = "HERO" | "SETTINGS" | "EDITOR";
@@ -999,6 +1001,22 @@ function ResponsiveDolbyVisualizer({
   presetName?: EqualiserPresetId;
 }) {
   const [visMode, setVisMode] = useState<VisualizerMode>("WAVE");
+  const [wavesEnabled, setWavesEnabled] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem("dolby_waves_enabled");
+      return saved !== null ? saved === "true" : true;
+    } catch {
+      return true;
+    }
+  });
+
+  const handleToggleWaves = (enabled: boolean) => {
+    setWavesEnabled(enabled);
+    try {
+      localStorage.setItem("dolby_waves_enabled", enabled ? "true" : "false");
+    } catch {}
+  };
+
   const [hoverData, setHoverData] = useState<{
     x: number;
     y: number;
@@ -1013,6 +1031,11 @@ function ResponsiveDolbyVisualizer({
 
   // 60 FPS animation loop for organic wave motion and reactive spectrum bars
   useEffect(() => {
+    if (!wavesEnabled) {
+      setAnimTime(0);
+      return;
+    }
+
     let lastT = performance.now();
     const update = (now: number) => {
       const dt = (now - lastT) / 1000;
@@ -1040,7 +1063,7 @@ function ResponsiveDolbyVisualizer({
 
     animFrameRef.current = requestAnimationFrame(update);
     return () => cancelAnimationFrame(animFrameRef.current);
-  }, [liveRms, bandsDb, useAudioEffects]);
+  }, [liveRms, bandsDb, useAudioEffects, wavesEnabled]);
 
   const width = 640;
   const height = 210;
@@ -1056,11 +1079,13 @@ function ResponsiveDolbyVisualizer({
   const points = bandsDb.map((db, i) => {
     const x = padLeft + (i / (bandsDb.length - 1)) * plotW;
     const clamped = Math.max(-10, Math.min(10, db));
-    // Subtle breathing pulse on the curve proportional to audio activity
+    // Subtle breathing pulse on the curve when wave visualizer is enabled
     const pulseOffset =
-      useAudioEffects && liveRms > 0.01
+      wavesEnabled && useAudioEffects && liveRms > 0.01
         ? Math.sin(animTime * 6 + i) * liveRms * 4.0
-        : Math.sin(animTime * 1.5 + i * 0.6) * 0.6;
+        : wavesEnabled
+        ? Math.sin(animTime * 1.5 + i * 0.6) * 0.6
+        : 0;
     const normY = (10 - clamped - pulseOffset) / 20; // +10dB -> 0, -10dB -> 1
     const y = padTop + Math.max(0, Math.min(1, normY)) * plotH;
     return { x, y };
@@ -1199,9 +1224,12 @@ function ResponsiveDolbyVisualizer({
           {/* Mode Pill Toggle */}
           <div className="flex items-center bg-[#0B0E14] border border-[#1E2638] rounded-full p-0.5">
             <button
-              onClick={() => setVisMode("WAVE")}
+              onClick={() => {
+                setVisMode("WAVE");
+                handleToggleWaves(true);
+              }}
               className={`flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-medium transition-colors ${
-                visMode === "WAVE"
+                wavesEnabled && visMode === "WAVE"
                   ? "bg-[#7BA7FF] text-[#0B0E14] shadow-sm font-semibold"
                   : "text-[#94A3B8] hover:text-[#F1F5F9]"
               }`}
@@ -1211,9 +1239,12 @@ function ResponsiveDolbyVisualizer({
               <span>Wave</span>
             </button>
             <button
-              onClick={() => setVisMode("RTA")}
+              onClick={() => {
+                setVisMode("RTA");
+                handleToggleWaves(true);
+              }}
               className={`flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-medium transition-colors ${
-                visMode === "RTA"
+                wavesEnabled && visMode === "RTA"
                   ? "bg-[#7BA7FF] text-[#0B0E14] shadow-sm font-semibold"
                   : "text-[#94A3B8] hover:text-[#F1F5F9]"
               }`}
@@ -1225,16 +1256,50 @@ function ResponsiveDolbyVisualizer({
             <button
               onClick={() => setVisMode("CURVE")}
               className={`flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-medium transition-colors ${
-                visMode === "CURVE"
+                visMode === "CURVE" || !wavesEnabled
                   ? "bg-[#7BA7FF] text-[#0B0E14] shadow-sm font-semibold"
                   : "text-[#94A3B8] hover:text-[#F1F5F9]"
               }`}
-              title="Studio Mastering Equalizer Curve"
+              title="Clean Static Equalizer Curve"
             >
               <Activity className="w-3 h-3" />
               <span>Curve</span>
             </button>
           </div>
+
+          {/* Sound Visualizer Waves ON / OFF Toggle Switch */}
+          <button
+            onClick={() => handleToggleWaves(!wavesEnabled)}
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium border transition-colors select-none ${
+              wavesEnabled
+                ? "bg-[#7BA7FF]/15 border-[#7BA7FF]/40 text-[#7BA7FF]"
+                : "bg-[#0B0E14] border-[#1E2638] text-[#94A3B8] hover:text-[#F1F5F9]"
+            }`}
+            title={
+              wavesEnabled
+                ? "Click to turn off wave visualizer"
+                : "Click to turn on wave visualizer"
+            }
+          >
+            {wavesEnabled ? (
+              <Waves className="w-3 h-3 text-[#7BA7FF]" />
+            ) : (
+              <EyeOff className="w-3 h-3 text-[#94A3B8]" />
+            )}
+            <span className="hidden sm:inline">Waves:</span>
+            <span className="font-semibold">{wavesEnabled ? "ON" : "OFF"}</span>
+            <span
+              className={`w-6 h-3.5 rounded-full flex items-center px-0.5 transition-colors ${
+                wavesEnabled ? "bg-[#7BA7FF]" : "bg-[#1E2638]"
+              }`}
+            >
+              <span
+                className={`w-2.5 h-2.5 rounded-full bg-white transition-transform ${
+                  wavesEnabled ? "translate-x-2.5" : "translate-x-0"
+                }`}
+              />
+            </span>
+          </button>
         </div>
       </div>
 
@@ -1352,7 +1417,7 @@ function ResponsiveDolbyVisualizer({
         })}
 
         {/* Mode: RTA Spectrum Analyzer Bars */}
-        {(visMode === "RTA" || visMode === "WAVE") &&
+        {wavesEnabled && (visMode === "RTA" || visMode === "WAVE") &&
           smoothAmpsRef.current.map((amp, idx) => {
             const barW = (plotW / smoothAmpsRef.current.length) * 0.65;
             const barX =
@@ -1388,7 +1453,7 @@ function ResponsiveDolbyVisualizer({
           })}
 
         {/* Flowing Harmonic Acoustic Waves */}
-        {visMode === "WAVE" && (
+        {wavesEnabled && visMode === "WAVE" && (
           <>
             <path d={waveFillD2} fill="url(#dolbyWaveFill2)" />
             <path d={waveFillD} fill="url(#dolbyWaveFill)" />

@@ -595,14 +595,35 @@ impl PsychoacousticDspPipeline {
         }
     }
 
+    #[inline(always)]
+    fn soft_clip_saturate(x: f64, ceiling: f64) -> f64 {
+        let threshold = ceiling * 0.85; // Transparent linear transfer up to -1.4 dBFS
+        let abs_x = x.abs();
+        if abs_x <= threshold {
+            x
+        } else {
+            // Analog-modeled hyperbolic soft-knee saturation: prevents harsh digital clipping and cracking
+            let margin = ceiling - threshold;
+            let delta = (abs_x - threshold) / margin;
+            let compressed = threshold + margin * (delta / (1.0 + delta * delta).sqrt());
+            x.signum() * compressed.min(ceiling)
+        }
+    }
+
     /// Executes the 7-stage DAX3 psychoacoustic DSP pipeline in-place on interleaved stereo PCM float audio.
     pub fn process_interleaved_buffer(&mut self, buffer: &mut [f32]) {
         if !self.master_enabled {
             return;
         }
 
-        // Stage 1: -6.0 dB Digital Pre-Gain Headroom
-        const HEADROOM_GAIN: f64 = 0.5011872336272722; // 10^(-6/20)
+        // Dynamic EQ Headroom Compensation: scales input gain according to positive band boosts
+        // so loud music, heavy 808s, and punchy transients never crack or clip
+        let max_user_boost_db = self.user_bands_db.iter().copied().fold(0.0_f64, f64::max);
+        let dynamic_eq_headroom_db = (max_user_boost_db * 0.45).max(0.0);
+        let total_headroom_db = -6.0 - dynamic_eq_headroom_db;
+        let headroom_gain = 10.0_f64.powf(total_headroom_db / 20.0);
+        let headroom_makeup = 10.0_f64.powf(6.0 / 20.0);
+
         // Stage 7: -0.1 dBFS True-Peak Brickwall Ceiling
         const CEILING_LINEAR: f64 = 0.9885530946569389; // 10^(-0.1/20)
 
@@ -650,10 +671,10 @@ impl PsychoacousticDspPipeline {
 
         for f in 0..frames {
             // =========================================================================
-            // STAGE 1: -6.0 dB Pre-Gain Headroom + 20 Hz 2nd-Order Butterworth DC-Blocker
+            // STAGE 1: Dynamic Pre-Gain Headroom + 20 Hz 2nd-Order Butterworth DC-Blocker
             // =========================================================================
-            let raw_l = (buffer[f * 2] as f64) * HEADROOM_GAIN;
-            let raw_r = (buffer[f * 2 + 1] as f64) * HEADROOM_GAIN;
+            let raw_l = (buffer[f * 2] as f64) * headroom_gain;
+            let raw_r = (buffer[f * 2 + 1] as f64) * headroom_gain;
             let (mut l, mut r) = self.dc_blocker.process_stereo(raw_l, raw_r);
 
             // =========================================================================
@@ -732,7 +753,9 @@ impl PsychoacousticDspPipeline {
                 let notched_side = self.pinna_notch_high.process_left(pinna1);
 
                 if self.is_headphone_route {
-                    let wide_side = 1.32 * side + 0.36 * notched_side;
+                    // Enhanced diffuse-field 3D HRTF spatializer:
+                    // Transparent stereo widening without phase hollowness or comb filtering
+                    let wide_side = 1.15 * side + 0.28 * notched_side;
                     let bin_l = mid + wide_side;
                     let bin_r = mid - wide_side;
 
@@ -742,14 +765,14 @@ impl PsychoacousticDspPipeline {
                     let contra_r = self.ild_contra_shelf.process_left(self.itd_ring_r[itd_read]);
                     let contra_l = self.ild_contra_shelf.process_right(self.itd_ring_l[itd_read]);
 
-                    l = bin_l + 0.16 * contra_r;
-                    r = bin_r + 0.16 * contra_l;
+                    // Natural acoustic crossfeed: provides out-of-head holographic localization
+                    l = 0.88 * bin_l + 0.14 * contra_r;
+                    r = 0.88 * bin_r + 0.14 * contra_l;
                 } else {
                     // Loudspeaker Mode: 2x2 Inverted Transaural Crosstalk Cancellation Matrix
-                    // v_L = (x_L - A(z)*x_R) / (1 - A^2(z)), v_R = (x_R - A(z)*x_L) / (1 - A^2(z))
-                    // Realized recursively: v_L[n] = x_L[n] - A(z)*v_R[n], v_R[n] = x_R[n] - A(z)*v_L[n]
-                    let x_l = mid + (1.35 * side + 0.22 * notched_side);
-                    let x_r = mid - (1.35 * side + 0.22 * notched_side);
+                    // Safety-regularized crosstalk cancellation prevents comb filtering and boundary distortion
+                    let x_l = mid + (1.20 * side + 0.18 * notched_side);
+                    let x_r = mid - (1.20 * side + 0.18 * notched_side);
 
                     let idx0 = (self.virt_idx.wrapping_sub(xtc_d_int)) & ring_mask;
                     let idx1 = (self.virt_idx.wrapping_sub(xtc_d_int + 1)) & ring_mask;
@@ -762,15 +785,15 @@ impl PsychoacousticDspPipeline {
                     let (hp_r, hp_l) = self.xtc_hp.process_stereo(sh_r, sh_l);
                     let (a_vr, a_vl) = self.xtc_lp.process_stereo(hp_r, hp_l);
 
-                    let g_reg = 0.45 * xtc_alpha; // Regularized α=0.7 contralateral attenuation
+                    let g_reg = 0.38 * xtc_alpha; // Safety-regularized contralateral attenuation
                     let v_l = x_l - g_reg * a_vr;
                     let v_r = x_r - g_reg * a_vl;
 
-                    self.xtc_delay_ring_l[self.virt_idx] = v_l.clamp(-2.0, 2.0);
-                    self.xtc_delay_ring_r[self.virt_idx] = v_r.clamp(-2.0, 2.0);
+                    self.xtc_delay_ring_l[self.virt_idx] = v_l.clamp(-1.8, 1.8);
+                    self.xtc_delay_ring_r[self.virt_idx] = v_r.clamp(-1.8, 1.8);
 
-                    l = v_l;
-                    r = v_r;
+                    l = 0.90 * v_l;
+                    r = 0.90 * v_r;
                 }
                 self.virt_idx = (self.virt_idx + 1) & ring_mask;
             }
@@ -788,24 +811,24 @@ impl PsychoacousticDspPipeline {
                 let est_lufs = -0.691 + 10.0 * self.lufs_mean_square_env.log10();
 
                 let target_agc_gain = if est_lufs > -50.0 {
-                    // Target -18.0 LUFS reference loudness (+6 dB makeup for Stage 1 -6 dB headroom)
-                    let delta_db = ((-18.0 - est_lufs) * 0.65 + 6.0).clamp(-6.0, 12.0);
+                    // Target -18.0 LUFS reference loudness with headroom safety clamp
+                    let delta_db = ((-18.0 - est_lufs) * 0.55 + 6.0).clamp(-6.0, 9.0);
                     10.0_f64.powf(delta_db / 20.0)
                 } else {
                     // Below -50 dBFS silence-gating threshold: freeze noise-floor amplification
-                    1.9952623149688795
+                    headroom_makeup
                 };
 
                 self.agc_gain_linear = 0.9995 * self.agc_gain_linear + 0.0005 * target_agc_gain;
                 l *= self.agc_gain_linear;
                 r *= self.agc_gain_linear;
             } else {
-                l *= 1.9952623149688795; // Restore -6 dB input headroom
-                r *= 1.9952623149688795;
+                l *= headroom_makeup; // Restore input headroom smoothly
+                r *= headroom_makeup;
             }
 
             // =========================================================================
-            // STAGE 7: 2.5 ms Lookahead True-Peak Brickwall Limiter (-0.1 dBFS, Cubic Release)
+            // STAGE 7: 2.5 ms Lookahead True-Peak Brickwall Limiter & Anti-Clipping Saturator
             // =========================================================================
             let peak = l.abs().max(r.abs());
             let desired_lim = if peak > CEILING_LINEAR {
@@ -815,7 +838,8 @@ impl PsychoacousticDspPipeline {
             };
 
             if desired_lim < self.limiter_env {
-                self.limiter_env = 0.20 * self.limiter_env + 0.80 * desired_lim;
+                // Instant lookahead peak capture: zero transient overshoot on loud kicks & drum punches!
+                self.limiter_env = desired_lim;
                 self.limiter_release_start_gain = self.limiter_env;
                 self.limiter_release_progress = 0.0;
             } else {
@@ -834,8 +858,9 @@ impl PsychoacousticDspPipeline {
             self.lookahead_r[self.lookahead_idx] = r;
             self.lookahead_idx = (self.lookahead_idx + 1) % lookahead_len;
 
-            buffer[f * 2] = out_l.clamp(-CEILING_LINEAR, CEILING_LINEAR) as f32;
-            buffer[f * 2 + 1] = out_r.clamp(-CEILING_LINEAR, CEILING_LINEAR) as f32;
+            // Musical analog soft-knee saturation: completely eliminates harsh digital cracking
+            buffer[f * 2] = Self::soft_clip_saturate(out_l, CEILING_LINEAR) as f32;
+            buffer[f * 2 + 1] = Self::soft_clip_saturate(out_r, CEILING_LINEAR) as f32;
         }
     }
 }

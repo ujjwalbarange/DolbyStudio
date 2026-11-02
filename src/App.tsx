@@ -1091,9 +1091,10 @@ function ResponsiveDolbyVisualizer({
     padTop + plotH
   ).toFixed(1)} L ${points[0].x.toFixed(1)} ${(padTop + plotH).toFixed(1)} Z`;
 
-  // Secondary flowing acoustic harmonic wave beneath the curve
+  // Secondary flowing acoustic harmonic waves beneath the curve
   let waveD = "";
-  const wavePointsCount = 28;
+  let waveD2 = "";
+  const wavePointsCount = 32;
   for (let w = 0; w <= wavePointsCount; w++) {
     const frac = w / wavePointsCount;
     const wx = padLeft + frac * plotW;
@@ -1101,15 +1102,27 @@ function ResponsiveDolbyVisualizer({
     const db = bandsDb[bandIdx];
     const baseNormY = (10 - db) / 20;
     const baseY = padTop + baseNormY * plotH;
-    const waveAmp = (useAudioEffects ? (liveRms * 12 + 4) : 2) * Math.sin(animTime * 3.5 + frac * Math.PI * 3);
-    const wy = Math.min(padTop + plotH, Math.max(padTop, baseY + 18 + waveAmp));
+
+    // Primary harmonic wave
+    const waveAmp1 = (useAudioEffects ? (liveRms * 16 + 5) : 3) * Math.sin(animTime * 3.8 + frac * Math.PI * 3.2);
+    const wy1 = Math.min(padTop + plotH, Math.max(padTop, baseY + 16 + waveAmp1));
+
+    // Secondary counter-phase flowing wave
+    const waveAmp2 = (useAudioEffects ? (liveRms * 12 + 3) : 2) * Math.cos(animTime * 2.8 + frac * Math.PI * 2.5 + 1.2);
+    const wy2 = Math.min(padTop + plotH, Math.max(padTop, baseY + 24 + waveAmp2));
+
     if (w === 0) {
-      waveD = `M ${wx.toFixed(1)} ${wy.toFixed(1)}`;
+      waveD = `M ${wx.toFixed(1)} ${wy1.toFixed(1)}`;
+      waveD2 = `M ${wx.toFixed(1)} ${wy2.toFixed(1)}`;
     } else {
-      waveD += ` L ${wx.toFixed(1)} ${wy.toFixed(1)}`;
+      waveD += ` L ${wx.toFixed(1)} ${wy1.toFixed(1)}`;
+      waveD2 += ` L ${wx.toFixed(1)} ${wy2.toFixed(1)}`;
     }
   }
   const waveFillD = `${waveD} L ${(padLeft + plotW).toFixed(1)} ${(
+    padTop + plotH
+  ).toFixed(1)} L ${padLeft.toFixed(1)} ${(padTop + plotH).toFixed(1)} Z`;
+  const waveFillD2 = `${waveD2} L ${(padLeft + plotW).toFixed(1)} ${(
     padTop + plotH
   ).toFixed(1)} L ${padLeft.toFixed(1)} ${(padTop + plotH).toFixed(1)} Z`;
 
@@ -1156,7 +1169,7 @@ function ResponsiveDolbyVisualizer({
           {/* Voice Enhancement indicator badge */}
           <div className="hidden sm:flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-[#7BA7FF]/15 border border-[#7BA7FF]/35 text-[#7BA7FF] font-medium text-[11px]">
             <Sparkles className="w-3 h-3 shrink-0" />
-            <span>Voice Enhancement Active (+1.5 dB)</span>
+            <span>Voice Enhancement Active (+1.8 dB)</span>
           </div>
         </div>
 
@@ -1241,6 +1254,11 @@ function ResponsiveDolbyVisualizer({
           <linearGradient id="dolbyWaveFill" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="#38BDF8" stopOpacity="0.28" />
             <stop offset="100%" stopColor="#38BDF8" stopOpacity="0.0" />
+          </linearGradient>
+
+          <linearGradient id="dolbyWaveFill2" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#818CF8" stopOpacity="0.22" />
+            <stop offset="100%" stopColor="#818CF8" stopOpacity="0.0" />
           </linearGradient>
 
           <linearGradient id="dolbyRtaBar" x1="0" y1="0" x2="0" y2="1">
@@ -1369,9 +1387,12 @@ function ResponsiveDolbyVisualizer({
             );
           })}
 
-        {/* Flowing Harmonic Acoustic Wave */}
+        {/* Flowing Harmonic Acoustic Waves */}
         {visMode === "WAVE" && (
-          <path d={waveFillD} fill="url(#dolbyWaveFill)" />
+          <>
+            <path d={waveFillD2} fill="url(#dolbyWaveFill2)" />
+            <path d={waveFillD} fill="url(#dolbyWaveFill)" />
+          </>
         )}
 
         {/* Gradient Fill Under Main Cubic Bézier Curve */}

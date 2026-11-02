@@ -637,11 +637,11 @@ impl PsychoacousticDspPipeline {
         }
 
         // Update Dialog Enhancer Mid-channel formant boost based on vocal activity ratio rho_speech[n]
-        // Includes baseline voice enhancement (+1.5 dB) across all presets + dynamic adaptive speech lift
+        // Includes baseline voice enhancement (+1.8 dB) across all presets + dynamic adaptive speech lift
         let rho_speech = (self.speech_energy_env / (self.mid_broadband_energy_env + EPSILON)).clamp(0.0, 1.0);
-        let dialog_boost_db = (1.5 + 3.2 * rho_speech).clamp(1.2, 4.8);
+        let dialog_boost_db = (1.8 + 3.6 * rho_speech).clamp(1.5, 5.2);
         self.dialog_mid_peak
-            .set_peaking_eq(2400.0, 0.85, dialog_boost_db, SAMPLE_RATE);
+            .set_peaking_eq(2400.0, 0.82, dialog_boost_db, SAMPLE_RATE);
 
         let bass_drive = 0.16 * (1.0 + (self.user_bands_db[0].max(0.0) + self.user_bands_db[1].max(0.0)) / 16.0);
         let k2 = 0.52 * bass_drive;

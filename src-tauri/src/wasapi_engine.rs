@@ -399,36 +399,45 @@ mod win_wasapi {
 
             results
         }
+    }
 
-        pub fn set_hardware_endpoint_volume(device_id: &str, volume: f32) -> Result<(), String> {
-            unsafe {
-                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-                let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-                    .map_err(|e| format!("CoCreateInstance error: {:?}", e))?;
+    pub fn set_hardware_endpoint_volume(device_id: &str, volume: f32) -> Result<(), String> {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                .map_err(|e| format!("CoCreateInstance error: {:?}", e))?;
 
+            let device: IMMDevice = if device_id.is_empty() || device_id == "default_wasapi_render" {
+                enumerator
+                    .GetDefaultAudioEndpoint(eRender, eConsole)
+                    .map_err(|e| format!("GetDefaultAudioEndpoint failed: {:?}", e))?
+            } else {
                 let wide: Vec<u16> = device_id.encode_utf16().chain(std::iter::once(0)).collect();
-                let device: IMMDevice = enumerator
-                    .GetDevice(PCWSTR(wide.as_ptr()))
-                    .map_err(|e| format!("GetDevice failed for endpoint '{}': {:?}", device_id, e))?;
+                match enumerator.GetDevice(PCWSTR(wide.as_ptr())) {
+                    Ok(d) => d,
+                    Err(_) => enumerator
+                        .GetDefaultAudioEndpoint(eRender, eConsole)
+                        .map_err(|e| format!("GetDevice & fallback failed for endpoint '{}': {:?}", device_id, e))?,
+                }
+            };
 
-                let endpoint_vol: IAudioEndpointVolume = device
-                    .Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
-                    .map_err(|e| format!("Activate IAudioEndpointVolume error: {:?}", e))?;
+            let endpoint_vol: IAudioEndpointVolume = device
+                .Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
+                .map_err(|e| format!("Activate IAudioEndpointVolume error: {:?}", e))?;
 
-                let clamped = volume.clamp(0.0, 1.0);
-                endpoint_vol
-                    .SetMasterVolumeLevelScalar(clamped, ptr::null())
-                    .map_err(|e| format!("SetMasterVolumeLevelScalar error: {:?}", e))?;
+            let clamped = volume.clamp(0.0, 1.0);
+            endpoint_vol
+                .SetMasterVolumeLevelScalar(clamped, ptr::null())
+                .map_err(|e| format!("SetMasterVolumeLevelScalar error: {:?}", e))?;
 
-                if clamped > 0.0 {
-                    if let Ok(is_muted) = endpoint_vol.GetMute() {
-                        if is_muted.as_bool() {
-                            let _ = endpoint_vol.SetMute(windows::Win32::Foundation::BOOL(0), ptr::null());
-                        }
+            if clamped > 0.0 {
+                if let Ok(is_muted) = endpoint_vol.GetMute() {
+                    if is_muted.as_bool() {
+                        let _ = endpoint_vol.SetMute(windows::Win32::Foundation::BOOL(0), ptr::null());
                     }
                 }
-                Ok(())
             }
+            Ok(())
         }
     }
 

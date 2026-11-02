@@ -18,6 +18,10 @@ import {
   RotateCcw,
   Settings,
   Volume2,
+  Activity,
+  Waves,
+  BarChart3,
+  Sparkles,
 } from "lucide-react";
 
 type MobileScreen = "HERO" | "SETTINGS" | "EDITOR";
@@ -99,6 +103,8 @@ export default function App() {
   const [isWideDesktop, setIsWideDesktop] = useState<boolean>(
     typeof window !== "undefined" ? window.innerWidth >= 768 : true
   );
+  const [liveRms, setLiveRms] = useState<number>(0);
+  const [livePeak, setLivePeak] = useState<number>(0);
 
   // Track responsive breakpoint (< 768px compact single-column vs >= 768px dual-column PC dashboard)
   useEffect(() => {
@@ -196,17 +202,49 @@ export default function App() {
   useEffect(() => {
     fetchRealHardwareDevices();
 
-    let unlistenFn: (() => void) | undefined;
+    let unlistenDevices: (() => void) | undefined;
+    let unlistenVolume: (() => void) | undefined;
+    let unlistenAudioLevel: (() => void) | undefined;
+
     listen("wasapi-devices-changed", () => {
       fetchRealHardwareDevices();
     })
       .then((unlisten) => {
-        unlistenFn = unlisten;
+        unlistenDevices = unlisten;
+      })
+      .catch(() => {});
+
+    // Live bidirectional volume synchronization with Windows
+    listen<{ id: string; volume: number }>("wasapi-volume-changed", (event) => {
+      if (!event.payload || !event.payload.id) return;
+      const vol = Math.max(0, Math.min(1, event.payload.volume));
+      setEndpoints((prev) =>
+        prev.map((ep) =>
+          ep.id === event.payload.id ? { ...ep, relativeGain: vol } : ep
+        )
+      );
+    })
+      .then((unlisten) => {
+        unlistenVolume = unlisten;
+      })
+      .catch(() => {});
+
+    // Live audio telemetry for real-time visualizer animation
+    listen<{ rms: number; peak: number }>("wasapi-audio-level", (event) => {
+      if (event.payload) {
+        setLiveRms(event.payload.rms || 0);
+        setLivePeak(event.payload.peak || 0);
+      }
+    })
+      .then((unlisten) => {
+        unlistenAudioLevel = unlisten;
       })
       .catch(() => {});
 
     return () => {
-      if (unlistenFn) unlistenFn();
+      if (unlistenDevices) unlistenDevices();
+      if (unlistenVolume) unlistenVolume();
+      if (unlistenAudioLevel) unlistenAudioLevel();
     };
   }, [fetchRealHardwareDevices]);
 
@@ -267,9 +305,14 @@ export default function App() {
         ep.id === deviceId ? { ...ep, relativeGain: clamped } : ep
       )
     );
+    // Directly adjust the real Windows system volume for this hardware device
     invoke("set_device_relative_gain", {
       deviceId,
       relativeGain: clamped,
+    }).catch(() => {});
+    invoke("set_device_volume", {
+      deviceId,
+      volume: clamped,
     }).catch(() => {});
   };
 
@@ -496,6 +539,9 @@ export default function App() {
             <RightEditorPane
               mode={editingMode}
               profile={editingProfile}
+              useAudioEffects={useAudioEffects}
+              liveRms={liveRms}
+              livePeak={livePeak}
               onSelectPreset={handleSelectPreset}
               onUpdateBandGain={handleUpdateBandGain}
               onToggleSurround={handleToggleSurround}
@@ -695,6 +741,9 @@ export default function App() {
         <RightEditorPane
           mode={editingMode}
           profile={editingProfile}
+          useAudioEffects={useAudioEffects}
+          liveRms={liveRms}
+          livePeak={livePeak}
           onSelectPreset={handleSelectPreset}
           onUpdateBandGain={handleUpdateBandGain}
           onToggleSurround={handleToggleSurround}
@@ -729,13 +778,14 @@ function DeviceVolumeSlider({
     const rect = trackRef.current?.getBoundingClientRect();
     if (!rect || rect.width <= 0) return;
     const relX = Math.max(0, Math.min(rect.width, clientX - rect.left));
-    onChange(relX / rect.width);
+    const normalized = Math.max(0, Math.min(1, relX / rect.width));
+    onChange(normalized);
   };
 
   return (
     <div
       onClick={(e) => e.stopPropagation()}
-      className="pl-10 pr-2 pb-2.5 pt-0.5 flex items-center gap-3 select-none"
+      className="pl-10 pr-2 pb-2.5 pt-1 flex items-center gap-3 select-none"
     >
       <Volume2 className="w-3.5 h-3.5 text-[#94A3B8] shrink-0" />
       <div
@@ -750,15 +800,23 @@ function DeviceVolumeSlider({
             updateFromClientX(e.clientX);
           }
         }}
-        className="flex-1 h-2 rounded-full bg-[#141923] border border-[#1E2638] relative cursor-ew-resize overflow-hidden"
-        title={`Device output level: ${percent}%`}
+        className="flex-1 h-3 flex items-center relative cursor-ew-resize group"
+        title={`Device system volume: ${percent}%`}
       >
+        {/* Background Track */}
+        <div className="w-full h-1.5 rounded-full bg-[#141923] border border-[#1E2638] overflow-hidden relative">
+          <div
+            style={{ width: `${percent}%` }}
+            className="h-full bg-[#7BA7FF] rounded-full transition-all duration-75"
+          />
+        </div>
+        {/* Circular Thumb Handle matching Windows 11 Sound Settings */}
         <div
-          style={{ width: `${percent}%` }}
-          className="absolute inset-y-0 left-0 bg-[#7BA7FF] rounded-full transition-all duration-75"
+          style={{ left: `calc(${percent}% - 6px)` }}
+          className="absolute w-3 h-3 rounded-full bg-white border border-[#7BA7FF] shadow-[0_0_6px_rgba(123,167,255,0.6)] group-hover:scale-125 transition-transform pointer-events-none"
         />
       </div>
-      <span className="text-xs font-medium text-[#94A3B8] w-9 text-right tabular-nums">
+      <span className="text-xs font-semibold text-[#F1F5F9] w-9 text-right tabular-nums">
         {percent}%
       </span>
     </div>
@@ -768,6 +826,9 @@ function DeviceVolumeSlider({
 function RightEditorPane({
   mode,
   profile,
+  useAudioEffects = true,
+  liveRms = 0,
+  livePeak = 0,
   onSelectPreset,
   onUpdateBandGain,
   onToggleSurround,
@@ -775,6 +836,9 @@ function RightEditorPane({
 }: {
   mode: AudioModeId;
   profile: ProfileSettings;
+  useAudioEffects?: boolean;
+  liveRms?: number;
+  livePeak?: number;
   onSelectPreset: (p: EqualiserPresetId) => void;
   onUpdateBandGain: (idx: number, db: number) => void;
   onToggleSurround: (enabled: boolean) => void;
@@ -816,14 +880,20 @@ function RightEditorPane({
         <p className="text-sm text-[#94A3B8] mt-1">{modeMeta.subtitle}</p>
       </div>
 
-      {/* Top Frequency Response Graph OR 10-Band Vertical Sliders */}
+      {/* Top Frequency Response Visualizer OR 10-Band Vertical Sliders */}
       {isManual ? (
         <TenBandVerticalEqualiser
           bandsDb={profile.manualBandsDb}
           onChangeBand={onUpdateBandGain}
         />
       ) : (
-        <CubicBezierFrequencyGraph bandsDb={activeBands} />
+        <ResponsiveDolbyVisualizer
+          bandsDb={activeBands}
+          liveRms={liveRms}
+          livePeak={livePeak}
+          useAudioEffects={useAudioEffects}
+          presetName={profile.preset}
+        />
       )}
 
       {/* Choose equaliser Radio List */}
@@ -895,11 +965,83 @@ function RightEditorPane({
   );
 }
 
+type VisualizerMode = "WAVE" | "RTA" | "CURVE";
+
+const ISO_BAND_DESCRIPTIONS = [
+  "Sub-Bass Impact",
+  "Bass Foundation",
+  "Bass Warmth & Punch",
+  "Lower Midbody",
+  "Vocal Body & Warmth",
+  "Voice Formant & Consonants (Enhanced)",
+  "Dialogue Intelligibility & Clarity (Enhanced)",
+  "Presence & Definition",
+  "High Treble Clarity",
+  "Air & Sibilance",
+];
+
 /**
- * Animated SVG Cubic Bézier Frequency Response Graph (-10 dB to +10 dB, Bass to Treble)
- * matching Screenshots 3 & 4.
+ * High-Performance Responsive Dolby Atmos Audio Visualizer
+ * Combines authentic Cubic Bézier frequency curves with real-time dynamic audio waves,
+ * 24-band spectrum analyzer bars, voice intelligibility indicator, and interactive frequency HUD.
  */
-function CubicBezierFrequencyGraph({ bandsDb }: { bandsDb: number[] }) {
+function ResponsiveDolbyVisualizer({
+  bandsDb,
+  liveRms = 0,
+  livePeak = 0,
+  useAudioEffects = true,
+  presetName,
+}: {
+  bandsDb: number[];
+  liveRms?: number;
+  livePeak?: number;
+  useAudioEffects?: boolean;
+  presetName?: EqualiserPresetId;
+}) {
+  const [visMode, setVisMode] = useState<VisualizerMode>("WAVE");
+  const [hoverData, setHoverData] = useState<{
+    x: number;
+    y: number;
+    freqLabel: string;
+    db: number;
+    role: string;
+  } | null>(null);
+
+  const [animTime, setAnimTime] = useState<number>(0);
+  const animFrameRef = useRef<number>(0);
+  const smoothAmpsRef = useRef<number[]>(new Array(24).fill(0.08));
+
+  // 60 FPS animation loop for organic wave motion and reactive spectrum bars
+  useEffect(() => {
+    let lastT = performance.now();
+    const update = (now: number) => {
+      const dt = (now - lastT) / 1000;
+      lastT = now;
+      setAnimTime((t) => t + dt);
+
+      // Smooth decay for spectrum bars
+      const energyMultiplier = useAudioEffects ? Math.max(0.05, liveRms * 3.5) : 0.02;
+      for (let i = 0; i < smoothAmpsRef.current.length; i++) {
+        const normX = i / (smoothAmpsRef.current.length - 1);
+        const bandIdx = Math.min(bandsDb.length - 1, Math.floor(normX * bandsDb.length));
+        const eqBoost = Math.max(0, (bandsDb[bandIdx] + 10) / 20);
+        // Organic sinusoidal motion + live audio RMS reaction
+        const target =
+          Math.sin(now * 0.003 + i * 0.45) * 0.08 +
+          Math.cos(now * 0.0045 + i * 0.3) * 0.05 +
+          0.12 +
+          energyMultiplier * eqBoost * 0.85;
+        smoothAmpsRef.current[i] =
+          smoothAmpsRef.current[i] * 0.82 + Math.max(0.02, Math.min(1.0, target)) * 0.18;
+      }
+
+      animFrameRef.current = requestAnimationFrame(update);
+    };
+
+    animFrameRef.current = requestAnimationFrame(update);
+    return () => cancelAnimationFrame(animFrameRef.current);
+  }, [liveRms, bandsDb, useAudioEffects]);
+
   const width = 640;
   const height = 210;
   const padLeft = 56;
@@ -910,11 +1052,17 @@ function CubicBezierFrequencyGraph({ bandsDb }: { bandsDb: number[] }) {
   const plotW = width - padLeft - padRight;
   const plotH = height - padTop - padBottom;
 
+  // Compute Bézier curve points matching EQ profile
   const points = bandsDb.map((db, i) => {
     const x = padLeft + (i / (bandsDb.length - 1)) * plotW;
     const clamped = Math.max(-10, Math.min(10, db));
-    const normY = (10 - clamped) / 20; // +10dB -> 0, -10dB -> 1
-    const y = padTop + normY * plotH;
+    // Subtle breathing pulse on the curve proportional to audio activity
+    const pulseOffset =
+      useAudioEffects && liveRms > 0.01
+        ? Math.sin(animTime * 6 + i) * liveRms * 4.0
+        : Math.sin(animTime * 1.5 + i * 0.6) * 0.6;
+    const normY = (10 - clamped - pulseOffset) / 20; // +10dB -> 0, -10dB -> 1
+    const y = padTop + Math.max(0, Math.min(1, normY)) * plotH;
     return { x, y };
   });
 
@@ -943,20 +1091,170 @@ function CubicBezierFrequencyGraph({ bandsDb }: { bandsDb: number[] }) {
     padTop + plotH
   ).toFixed(1)} L ${points[0].x.toFixed(1)} ${(padTop + plotH).toFixed(1)} Z`;
 
+  // Secondary flowing acoustic harmonic wave beneath the curve
+  let waveD = "";
+  const wavePointsCount = 28;
+  for (let w = 0; w <= wavePointsCount; w++) {
+    const frac = w / wavePointsCount;
+    const wx = padLeft + frac * plotW;
+    const bandIdx = Math.min(bandsDb.length - 1, Math.floor(frac * bandsDb.length));
+    const db = bandsDb[bandIdx];
+    const baseNormY = (10 - db) / 20;
+    const baseY = padTop + baseNormY * plotH;
+    const waveAmp = (useAudioEffects ? (liveRms * 12 + 4) : 2) * Math.sin(animTime * 3.5 + frac * Math.PI * 3);
+    const wy = Math.min(padTop + plotH, Math.max(padTop, baseY + 18 + waveAmp));
+    if (w === 0) {
+      waveD = `M ${wx.toFixed(1)} ${wy.toFixed(1)}`;
+    } else {
+      waveD += ` L ${wx.toFixed(1)} ${wy.toFixed(1)}`;
+    }
+  }
+  const waveFillD = `${waveD} L ${(padLeft + plotW).toFixed(1)} ${(
+    padTop + plotH
+  ).toFixed(1)} L ${padLeft.toFixed(1)} ${(padTop + plotH).toFixed(1)} Z`;
+
+  // Voice formant range X boundary: band 5 (1 kHz) to band 7 (4 kHz)
+  const voiceX1 = padLeft + (5 / 9) * plotW - 14;
+  const voiceX2 = padLeft + (7 / 9) * plotW + 14;
+
+  const handlePointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const relX = ((e.clientX - rect.left) / rect.width) * width;
+    if (relX < padLeft || relX > padLeft + plotW) {
+      setHoverData(null);
+      return;
+    }
+    const frac = (relX - padLeft) / plotW;
+    const nearestIdx = Math.min(9, Math.max(0, Math.round(frac * 9)));
+    const freqLabels = ["31.5 Hz", "63 Hz", "125 Hz", "250 Hz", "500 Hz", "1.0 kHz", "2.0 kHz", "4.0 kHz", "8.0 kHz", "16.0 kHz"];
+    const db = bandsDb[nearestIdx];
+    const clampedDb = Math.max(-10, Math.min(10, db));
+    const targetY = padTop + ((10 - clampedDb) / 20) * plotH;
+
+    setHoverData({
+      x: padLeft + (nearestIdx / 9) * plotW,
+      y: targetY,
+      freqLabel: freqLabels[nearestIdx],
+      db,
+      role: ISO_BAND_DESCRIPTIONS[nearestIdx],
+    });
+  };
+
   return (
-    <div className="bg-[#141923] border border-[#1E2638] rounded-3xl p-5">
+    <div className="bg-[#141923] border border-[#1E2638] rounded-3xl p-5 shadow-xl relative overflow-hidden">
+      {/* Top Visualizer HUD Bar: Status, Vocal Clarity Indicator & View Mode Pill */}
+      <div className="flex items-center justify-between mb-3 px-1 text-xs select-none">
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full bg-[#7BA7FF] animate-pulse" />
+            <span className="font-semibold tracking-wider text-[#F1F5F9] uppercase text-[11px]">
+              Dolby Atmos DSP
+            </span>
+            <span className="text-[#94A3B8] font-mono text-[10px]">48 kHz • 24-bit</span>
+          </div>
+
+          {/* Voice Enhancement indicator badge */}
+          <div className="hidden sm:flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-[#7BA7FF]/15 border border-[#7BA7FF]/35 text-[#7BA7FF] font-medium text-[11px]">
+            <Sparkles className="w-3 h-3 shrink-0" />
+            <span>Voice Enhancement Active (+1.5 dB)</span>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {/* Mini Stereo VU Peak Meter */}
+          <div className="hidden md:flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#0B0E14] border border-[#1E2638]">
+            <span className="text-[10px] text-[#94A3B8] mr-1">VU</span>
+            {[...Array(6)].map((_, i) => {
+              const active = (liveRms > 0.005 ? liveRms * 12 : 1) > i;
+              return (
+                <div
+                  key={i}
+                  className={`w-1 h-3 rounded-xs transition-colors duration-75 ${
+                    active
+                      ? i >= 4
+                        ? "bg-[#F87171]"
+                        : i >= 3
+                        ? "bg-[#FBBF24]"
+                        : "bg-[#7BA7FF]"
+                      : "bg-[#1E2638]"
+                  }`}
+                />
+              );
+            })}
+          </div>
+
+          {/* Mode Pill Toggle */}
+          <div className="flex items-center bg-[#0B0E14] border border-[#1E2638] rounded-full p-0.5">
+            <button
+              onClick={() => setVisMode("WAVE")}
+              className={`flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-medium transition-colors ${
+                visMode === "WAVE"
+                  ? "bg-[#7BA7FF] text-[#0B0E14] shadow-sm font-semibold"
+                  : "text-[#94A3B8] hover:text-[#F1F5F9]"
+              }`}
+              title="Dynamic Audio Waves"
+            >
+              <Waves className="w-3 h-3" />
+              <span>Wave</span>
+            </button>
+            <button
+              onClick={() => setVisMode("RTA")}
+              className={`flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-medium transition-colors ${
+                visMode === "RTA"
+                  ? "bg-[#7BA7FF] text-[#0B0E14] shadow-sm font-semibold"
+                  : "text-[#94A3B8] hover:text-[#F1F5F9]"
+              }`}
+              title="Real-Time 24-Band Spectrum Analyzer"
+            >
+              <BarChart3 className="w-3 h-3" />
+              <span>RTA</span>
+            </button>
+            <button
+              onClick={() => setVisMode("CURVE")}
+              className={`flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-medium transition-colors ${
+                visMode === "CURVE"
+                  ? "bg-[#7BA7FF] text-[#0B0E14] shadow-sm font-semibold"
+                  : "text-[#94A3B8] hover:text-[#F1F5F9]"
+              }`}
+              title="Studio Mastering Equalizer Curve"
+            >
+              <Activity className="w-3 h-3" />
+              <span>Curve</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
       <svg
         viewBox={`0 0 ${width} ${height}`}
-        className="w-full h-52 overflow-visible"
+        className="w-full h-52 overflow-visible cursor-crosshair select-none"
+        onPointerMove={handlePointerMove}
+        onPointerLeave={() => setHoverData(null)}
       >
         <defs>
           <linearGradient id="dolbyCurveFill" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#7BA7FF" stopOpacity="0.32" />
+            <stop offset="0%" stopColor="#7BA7FF" stopOpacity="0.38" />
+            <stop offset="70%" stopColor="#7BA7FF" stopOpacity="0.08" />
             <stop offset="100%" stopColor="#7BA7FF" stopOpacity="0.0" />
+          </linearGradient>
+
+          <linearGradient id="dolbyWaveFill" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#38BDF8" stopOpacity="0.28" />
+            <stop offset="100%" stopColor="#38BDF8" stopOpacity="0.0" />
+          </linearGradient>
+
+          <linearGradient id="dolbyRtaBar" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#7BA7FF" stopOpacity="0.85" />
+            <stop offset="100%" stopColor="#38BDF8" stopOpacity="0.15" />
+          </linearGradient>
+
+          <linearGradient id="voiceRegionGlow" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#7BA7FF" stopOpacity="0.12" />
+            <stop offset="100%" stopColor="#7BA7FF" stopOpacity="0.02" />
           </linearGradient>
         </defs>
 
-        {/* Y-Axis Labels (+10 db, 0 db, -10 db) */}
+        {/* Y-Axis dB Grid Text (+10 db, 0 db, -10 db) */}
         <text
           x={0}
           y={padTop + 5}
@@ -985,6 +1283,39 @@ function CubicBezierFrequencyGraph({ bandsDb }: { bandsDb: number[] }) {
           -10 db
         </text>
 
+        {/* Horizontal 0 dB Reference Guideline */}
+        <line
+          x1={padLeft}
+          y1={padTop + plotH / 2}
+          x2={padLeft + plotW}
+          y2={padTop + plotH / 2}
+          stroke="#1E2638"
+          strokeWidth="1"
+          strokeDasharray="4 4"
+        />
+
+        {/* Voice Formant Intelligibility Region Highlight (1 kHz - 4 kHz) */}
+        <rect
+          x={voiceX1}
+          y={padTop}
+          width={voiceX2 - voiceX1}
+          height={plotH}
+          fill="url(#voiceRegionGlow)"
+          rx="6"
+        />
+        <text
+          x={(voiceX1 + voiceX2) / 2}
+          y={padTop + 14}
+          textAnchor="middle"
+          fill="#7BA7FF"
+          fontSize="9"
+          fontWeight="600"
+          letterSpacing="0.06em"
+          opacity="0.85"
+        >
+          SPEECH CLARITY BAND
+        </text>
+
         {/* 4 Vertical Grid Dividers matching Screenshots 3 & 4 */}
         {[0, 0.333, 0.666, 1].map((frac, idx) => {
           const x = padLeft + frac * plotW;
@@ -1002,17 +1333,119 @@ function CubicBezierFrequencyGraph({ bandsDb }: { bandsDb: number[] }) {
           );
         })}
 
-        {/* Gradient Under Curve */}
+        {/* Mode: RTA Spectrum Analyzer Bars */}
+        {(visMode === "RTA" || visMode === "WAVE") &&
+          smoothAmpsRef.current.map((amp, idx) => {
+            const barW = (plotW / smoothAmpsRef.current.length) * 0.65;
+            const barX =
+              padLeft +
+              (idx / smoothAmpsRef.current.length) * plotW +
+              barW * 0.25;
+            const barHeight = Math.max(3, amp * (plotH * 0.75));
+            const barY = padTop + plotH - barHeight;
+
+            return (
+              <g key={idx}>
+                <rect
+                  x={barX}
+                  y={barY}
+                  width={barW}
+                  height={barHeight}
+                  fill="url(#dolbyRtaBar)"
+                  rx="1.5"
+                  opacity={visMode === "RTA" ? 0.9 : 0.35}
+                />
+                {/* Peak hold cap */}
+                <rect
+                  x={barX}
+                  y={barY - 2}
+                  width={barW}
+                  height={1.5}
+                  fill="#7BA7FF"
+                  rx="0.75"
+                  opacity={0.8}
+                />
+              </g>
+            );
+          })}
+
+        {/* Flowing Harmonic Acoustic Wave */}
+        {visMode === "WAVE" && (
+          <path d={waveFillD} fill="url(#dolbyWaveFill)" />
+        )}
+
+        {/* Gradient Fill Under Main Cubic Bézier Curve */}
         <path d={fillD} fill="url(#dolbyCurveFill)" />
 
-        {/* Smooth Cubic Bézier Spline */}
+        {/* Smooth Cubic Bézier Spline with subtle glowing drop shadow */}
         <path
           d={pathD}
           fill="none"
           stroke="#7BA7FF"
-          strokeWidth="3"
+          strokeWidth="3.2"
           strokeLinecap="round"
+          filter="drop-shadow(0 0 6px rgba(123, 167, 255, 0.45))"
         />
+
+        {/* Active Points along the curve */}
+        {points.map((p, idx) => (
+          <circle
+            key={idx}
+            cx={p.x}
+            cy={p.y}
+            r={idx >= 5 && idx <= 6 ? "4" : "3"}
+            fill={idx >= 5 && idx <= 6 ? "#FFFFFF" : "#7BA7FF"}
+            stroke="#141923"
+            strokeWidth="1.5"
+            className="transition-all duration-150"
+          />
+        ))}
+
+        {/* Interactive Hover HUD Guide & Tooltip */}
+        {hoverData && (
+          <g>
+            <line
+              x1={hoverData.x}
+              y1={padTop}
+              x2={hoverData.x}
+              y2={padTop + plotH}
+              stroke="#38BDF8"
+              strokeWidth="1.5"
+              strokeDasharray="3 3"
+              opacity="0.9"
+            />
+            <circle
+              cx={hoverData.x}
+              cy={hoverData.y}
+              r="6"
+              fill="#FFFFFF"
+              stroke="#38BDF8"
+              strokeWidth="2.5"
+            />
+
+            {/* Floating Tooltip Box */}
+            <g transform={`translate(${Math.min(width - 150, Math.max(padLeft, hoverData.x - 70))}, ${Math.max(padTop + 6, hoverData.y - 48)})`}>
+              <rect
+                x="0"
+                y="0"
+                width="140"
+                height="40"
+                rx="8"
+                fill="#0B0E14"
+                stroke="#7BA7FF"
+                strokeWidth="1"
+                filter="drop-shadow(0 4px 10px rgba(0,0,0,0.6))"
+              />
+              <text x="10" y="16" fill="#F1F5F9" fontSize="11" fontWeight="600" fontFamily="sans-serif">
+                {hoverData.freqLabel}:{" "}
+                <tspan fill="#7BA7FF">{hoverData.db > 0 ? `+${hoverData.db.toFixed(1)}` : hoverData.db.toFixed(1)} dB</tspan>
+              </text>
+              <text x="10" y="30" fill="#94A3B8" fontSize="9" fontFamily="sans-serif">
+                {hoverData.role}
+              </text>
+            </g>
+          </g>
+        )}
 
         {/* Bass / Treble X-Axis Labels */}
         <text

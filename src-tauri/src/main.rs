@@ -37,12 +37,23 @@ fn set_device_relative_gain(
     relative_gain: f32,
     state: State<'_, Arc<Mutex<SharedAudioEngineState>>>,
 ) -> Result<(), String> {
+    let clamped = relative_gain.clamp(0.0, 1.0);
     if let Ok(mut guard) = state.lock() {
         guard
             .device_relative_gains
-            .insert(device_id, relative_gain.clamp(0.0, 1.0));
+            .insert(device_id.clone(), clamped);
     }
+    let _ = wasapi_engine::set_device_volume_cross_platform(&device_id, clamped);
     Ok(())
+}
+
+#[tauri::command]
+fn set_device_volume(
+    device_id: String,
+    volume: f32,
+    state: State<'_, Arc<Mutex<SharedAudioEngineState>>>,
+) -> Result<(), String> {
+    set_device_relative_gain(device_id, volume, state)
 }
 
 #[tauri::command]
@@ -80,6 +91,7 @@ fn main() {
             get_wasapi_devices,
             set_selected_wasapi_devices,
             set_device_relative_gain,
+            set_device_volume,
             update_dsp_config
         ])
         .run(tauri::generate_context!())

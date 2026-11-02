@@ -352,10 +352,16 @@ mod win_wasapi {
                         state.original_physical_default_id = Some(id.clone());
                     }
 
-                    let rel_gain = *state
-                        .device_relative_gains
-                        .entry(id.clone())
-                        .or_insert(1.0_f32);
+                    // Query the real Windows system volume directly from the hardware endpoint
+                    let mut hw_volume = 1.0f32;
+                    if let Ok(endpoint_vol) = device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
+                        if let Ok(scalar) = endpoint_vol.GetMasterVolumeLevelScalar() {
+                            hw_volume = scalar.clamp(0.0, 1.0);
+                        }
+                    }
+
+                    // Update the internal stored gain with the actual hardware level
+                    state.device_relative_gains.insert(id.clone(), hw_volume);
 
                     results.push(WasapiEndpointInfo {
                         id,
@@ -364,7 +370,7 @@ mod win_wasapi {
                         is_default,
                         is_headphone,
                         is_selected: false,
-                        relative_gain: rel_gain,
+                        relative_gain: hw_volume,
                     });
                 }
             }
@@ -393,12 +399,44 @@ mod win_wasapi {
 
             results
         }
+
+        pub fn set_hardware_endpoint_volume(device_id: &str, volume: f32) -> Result<(), String> {
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                    .map_err(|e| format!("CoCreateInstance error: {:?}", e))?;
+
+                let wide: Vec<u16> = device_id.encode_utf16().chain(std::iter::once(0)).collect();
+                let device: IMMDevice = enumerator
+                    .GetDevice(PCWSTR(wide.as_ptr()))
+                    .map_err(|e| format!("GetDevice failed for endpoint '{}': {:?}", device_id, e))?;
+
+                let endpoint_vol: IAudioEndpointVolume = device
+                    .Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
+                    .map_err(|e| format!("Activate IAudioEndpointVolume error: {:?}", e))?;
+
+                let clamped = volume.clamp(0.0, 1.0);
+                endpoint_vol
+                    .SetMasterVolumeLevelScalar(clamped, ptr::null())
+                    .map_err(|e| format!("SetMasterVolumeLevelScalar error: {:?}", e))?;
+
+                if clamped > 0.0 {
+                    if let Ok(is_muted) = endpoint_vol.GetMute() {
+                        if is_muted.as_bool() {
+                            let _ = endpoint_vol.SetMute(windows::Win32::Foundation::BOOL(0), ptr::null());
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 
     struct ActiveWasapiOutputStream {
         device_id: String,
         audio_client: IAudioClient,
         render_client: IAudioRenderClient,
+        endpoint_volume: Option<IAudioEndpointVolume>,
         audio_clock: Option<IAudioClock>,
         event_handle: Option<HANDLE>,
         buffer_frames: u32,
@@ -618,6 +656,7 @@ mod win_wasapi {
             let mut active_outputs: Vec<ActiveWasapiOutputStream> = Vec::new();
             let mut dsp_work_buf: Vec<f32> = Vec::with_capacity(4096);
             let mut last_delay_sync_instant = Instant::now();
+            let mut last_telemetry_instant = Instant::now();
             let mut master_volume_scalar = 1.0_f64;
 
             loop {
@@ -784,10 +823,13 @@ mod win_wasapi {
                                             *rel_gains.get(&dev_id).unwrap_or(&1.0_f32) as f64;
                                         delay_buf.set_effective_gain(master_volume_scalar * rel_g);
 
+                                        let endpoint_vol = dev.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None).ok();
+
                                         let mut stream = ActiveWasapiOutputStream {
                                             device_id: dev_id,
                                             audio_client: render_audio_client,
                                             render_client,
+                                            endpoint_volume: endpoint_vol,
                                             audio_clock,
                                             event_handle: if used_evt { evt } else { None },
                                             buffer_frames: buf_frames,
@@ -846,6 +888,31 @@ mod win_wasapi {
                         .unwrap_or_default();
 
                     for out in active_outputs.iter_mut() {
+                        if let Some(ref ep_vol) = out.endpoint_volume {
+                            if let Ok(scalar) = ep_vol.GetMasterVolumeLevelScalar() {
+                                let hw_vol = scalar.clamp(0.0, 1.0);
+                                if let Ok(mut guard) = shared_state.lock() {
+                                    let current_val = guard
+                                        .device_relative_gains
+                                        .get(&out.device_id)
+                                        .copied()
+                                        .unwrap_or(1.0);
+                                    if (hw_vol - current_val).abs() > 0.005 {
+                                        guard
+                                            .device_relative_gains
+                                            .insert(out.device_id.clone(), hw_vol);
+                                        let _ = app_handle.emit(
+                                            "wasapi-volume-changed",
+                                            serde_json::json!({
+                                                "id": out.device_id,
+                                                "volume": hw_vol
+                                            }),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
                         let rel_g = *rel_gains.get(&out.device_id).unwrap_or(&1.0_f32) as f64;
                         out.delay_buffer
                             .set_effective_gain(master_volume_scalar * rel_g);
@@ -938,6 +1005,27 @@ mod win_wasapi {
                             }
                         }
 
+                        if last_telemetry_instant.elapsed() >= Duration::from_millis(35) {
+                            last_telemetry_instant = Instant::now();
+                            let mut sum_sq = 0.0f32;
+                            let mut peak = 0.0f32;
+                            for &samp in &dsp_work_buf[..sample_count] {
+                                let a = samp.abs();
+                                if a > peak {
+                                    peak = a;
+                                }
+                                sum_sq += samp * samp;
+                            }
+                            let rms = (sum_sq / (sample_count as f32).max(1.0)).sqrt();
+                            let _ = app_handle.emit(
+                                "wasapi-audio-level",
+                                serde_json::json!({
+                                    "rms": rms,
+                                    "peak": peak
+                                }),
+                            );
+                        }
+
                         // Write simultaneously to all ticked hardware endpoints with Hermite delay sync
                         for out in active_outputs.iter_mut() {
                             if out.temp_delayed.len() < sample_count {
@@ -1023,3 +1111,13 @@ pub fn start_audio_engine(
         let _ = (app_handle, shared_state);
     }
 }
+
+pub fn set_device_volume_cross_platform(device_id: &str, volume: f32) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        win_wasapi::set_hardware_endpoint_volume(device_id, volume)?;
+    }
+    let _ = (device_id, volume);
+    Ok(())
+}
+

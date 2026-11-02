@@ -571,7 +571,7 @@ impl PsychoacousticDspPipeline {
     }
 
     pub fn update_eq_bands(&mut self, bands_db: &[f32]) {
-        let base_target_db = [1.5, 2.0, 1.2, 0.5, 0.0, 0.8, 1.8, 2.5, 2.8, 2.2];
+        let base_target_db = [1.5, 2.0, 1.2, 0.8, 0.6, 1.4, 2.2, 2.8, 2.8, 2.2];
         for (i, &fc) in ISO_10_BAND_FREQS.iter().enumerate() {
             let db = bands_db.get(i).copied().unwrap_or(0.0).clamp(-10.0, 10.0) as f64;
             self.user_bands_db[i] = db;
@@ -637,8 +637,9 @@ impl PsychoacousticDspPipeline {
         }
 
         // Update Dialog Enhancer Mid-channel formant boost based on vocal activity ratio rho_speech[n]
+        // Includes baseline voice enhancement (+1.5 dB) across all presets + dynamic adaptive speech lift
         let rho_speech = (self.speech_energy_env / (self.mid_broadband_energy_env + EPSILON)).clamp(0.0, 1.0);
-        let dialog_boost_db = (3.6 * rho_speech).clamp(0.0, 4.5);
+        let dialog_boost_db = (1.5 + 3.2 * rho_speech).clamp(1.2, 4.8);
         self.dialog_mid_peak
             .set_peaking_eq(2400.0, 0.85, dialog_boost_db, SAMPLE_RATE);
 
